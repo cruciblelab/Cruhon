@@ -11,12 +11,17 @@ By [CrucibleLab](https://github.com/cruciblelab) · `.clpy` files · MIT License
 
 **Any fork, derivative work, or redistribution MUST retain "Cruhon" in its name.**
 
-✓ Allowed: "Cruhon Ubuntu", "Cruhon X", "Cruhon Community"  
-✗ Not allowed: "Ubuntu Language", "MyScript", "FastScript"
+✓ **Allowed:** "Cruhon Maxi", "Cruhon X", "Cruhon Community", "Cruhon Turkish"  
+✗ **Not allowed:** "Python Language", "MyScript", "FastScript"
 
-Redistributions without "Cruhon" in the name are trademark violations.
-You must also retain attribution to Crucible Lab in your documentation.
+**Requirements:**
+- Redistributions must include "Cruhon" in the name
+- Must retain attribution to Crucible Lab in documentation/README
+- Do not claim official endorsement without permission
 
+Violations of this trademark notice may result in legal action.
+
+---
 ---
 
 ## Features
