@@ -22,7 +22,6 @@ By [CrucibleLab](https://github.com/cruciblelab) · `.clpy` files · MIT License
 Violations of this trademark notice may result in legal action.
 
 ---
----
 
 ## Features
 ...
