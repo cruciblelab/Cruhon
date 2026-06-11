@@ -4,6 +4,23 @@
 By [CrucibleLab](https://github.com/cruciblelab) · `.clpy` files · MIT License · v2.0.0
 
 ---
+## ⚠️ Trademark Notice
+
+"Cruhon" and "Crucible" are trademarks of Crucible Lab.
+
+**Any fork, derivative work, or redistribution MUST retain "Cruhon" in its name.**
+
+✓ **Allowed:** "Cruhon Maxi", "Cruhon X", "Cruhon Community", "Cruhon Turkish"  
+✗ **Not allowed:** "Python Language", "MyScript", "FastScript"
+
+**Requirements:**
+- Redistributions must include "Cruhon" in the name
+- Must retain attribution to Crucible Lab in documentation/README
+- Do not claim official endorsement without permission
+
+Violations of this trademark notice may result in legal action.
+
+---	
 
 ## What is Cruhon?
 
