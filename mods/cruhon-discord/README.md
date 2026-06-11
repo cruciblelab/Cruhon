@@ -1,96 +1,143 @@
 # cruhon-discord
 
-Discord botu yazmak için Cruhon eklentisi. **BDFD (Bot Designer For Discord)
-gibi kod bilmeyenler bot yapabilir** — ama BDFD'nin aksine, Cruhon'u bilenler
-gerçek `class`, `if/else`, döngü, harici API çağrıları ve karmaşık mantık da
-kullanabilir. Aynı dil, üç katman.
+Discord bot plugin for Cruhon. Anyone can write a Discord bot quickly — and
+those who know Cruhon can also use real `class`, `if/else`, loops, external
+API calls, and complex logic. Same language, three layers.
 
-## Felsefe — 3 katman
+## Philosophy — 3 Layers
 
-| Katman | Kim | Ne yapabilir |
-|--------|-----|--------------|
-| **1** | Kod bilmeyen | `@discord.command`, `@discord.reply`, `@discord.send` — basit komutlar |
-| **2** | Biraz bilen | `@if/@else`, `@for`, `@var` — mantık ekler |
-| **3** | Cruhon'u bilen | `@class`, `@http.get` API çağrısı, embed, karmaşık akış |
+| Layer | Who | What they can do |
+|-------|-----|-----------------|
+| **1** | Non-programmer | `@discord.command`, `@discord.reply`, `@discord.send` — simple commands |
+| **2** | Intermediate | `@if/@else`, `@for`, `@var` — adds logic |
+| **3** | Cruhon user | `@class`, `@http.get` API calls, embeds, complex flows |
 
-BDFD katman 1'de kalır. Cruhon üçünü de aynı dosyada destekler.
-
-## Hızlı başlangıç
+## Quick Start
 
 ```clpy
 @discord.setup["TOKEN"; prefix="!"; intents="all"]
 
-@discord.command[selam; ctx]
-    @discord.reply[ctx; "Merhaba!"]
+@discord.command[hello; ctx]
+    @discord.reply[ctx; "Hello!"]
 @end
 
 @discord.run[]
 ```
 
-Çalıştır: `cruhon run bot.clpy`
+Run: `cruhon run bot.clpy`
 
-Tam örnek için bkz. [`examples/ornek_bot.clpy`](examples/ornek_bot.clpy).
+See full example at [`examples/example_bot.clpy`](examples/example_bot.clpy).
 
-## Komut grupları
+## Command Groups
 
-- **Kurulum:** `setup`, `run`, `sync_commands`, `start_task`, `stop_task`
-- **Olaylar (blok):** `on`, `command`, `slash`, `task`, `listen`
-- **Mesaj:** `send`, `reply`, `dm`, `respond`, `defer`, `followup`, `edit`, `delete`, `pin`
-- **Tepki:** `react`, `unreact`, `clear_reactions`
+- **Setup:** `setup`, `run`, `sync_commands`, `start_task`, `stop_task`
+- **Events (block):** `on` (90+ friendly aliases), `command`, `hybrid`, `slash`, `task` (`time=`/`count=`/`wait_ready=`), `listen`, `error_handler`
+- **UI (block):** `view`, `button`, `select` (string), `user_select`, `role_select`, `channel_select`, `mentionable_select`, `modal`, `cog`, `group`, `context_menu`
+- **Messaging:** `send`, `reply`, `dm`, `respond`, `respond_ephemeral`, `send_modal`, `defer`, `followup`, `edit`, `edit_embed`, `dm_embed`, `delete`, `pin`
+- **Reactions:** `react`, `add_reactions`, `unreact`, `clear_reactions`
 - **Embed:** `embed`, `add_field`, `set_footer`, `set_image`, `set_thumbnail`, `set_author`
-- **Moderasyon:** `ban`, `unban`, `kick`, `timeout`, `untimeout`, `add_role`, `remove_role`, `nickname`
-- **Kanal:** `purge`, `create_text`, `create_voice`, `delete_channel`
-- **Arama:** `get_member`, `get_channel`, `get_role`, `find_member`, `me`, `mention`
-- **Koruma:** `ignore_self`, `ignore_bots`, `require_role`, `require_guild`
-- **Durum:** `status`, `log`, `wait_for`
-- **Ses:** `join`, `leave`
+- **Moderation:** `ban`, `unban`, `kick`, `timeout`, `untimeout`, `add_role`, `remove_role`, `nickname`
+- **Channel:** `purge`, `bulk_purge`, `create_text`, `create_voice`, `delete_channel`
+- **Lookup:** `get_member`, `get_channel`, `get_role`, `find_member`, `me`, `mention`, `get_guild`, `get_user`
+- **Protection:** `ignore_self`, `ignore_bots`, `require_role`, `require_guild`
+- **Status:** `status`, `log`, `wait_for`
+- **Color:** `color` (`"#hex"` / RGB / named / decimal)
+- **Voice:** `join`, `leave`, `play`, `stop_audio`, `pause_audio`, `resume_audio`, `volume`, `is_playing`
+- **Inline checks:** `has_role`, `has_perm`, `is_bot_owner`
+- **Formatting:** `timestamp`, `jump`, `avatar`, `created`, `escape`, `escape_mentions`, `user_mention`, `channel_mention`, `role_mention`, `spoiler`, `codeblock`, `progress`, `oauth_url`, `snowflake_time`
 
-Tüm imzalar için `__init__.py` başındaki belge bloğuna bakın.
+Slash groups support full option config — `@param`, `@choice`, and
+`@autocomplete` work inside `@discord.group` subcommands exactly as they do
+in top-level `@discord.slash`. Views accept `persistent=True`
+(timeout=None — pair with `custom_id=` buttons and `@discord.add_view`).
 
-## @embed — kolay embed oluşturma
+For all signatures see the docstring block at the top of `__init__.py`.
 
-Tek satırda tam embed. İki sözdizimi desteklenir:
+## Interactive Components
 
-**Pozisyonel** (sıra: title → description → color → footer → image → thumbnail → author):
+**Hybrid commands** — one definition that registers as both a prefix command
+and a slash command:
+
 ```clpy
-@var[e; @embed["Başlık"; "Açıklama"]]
-@var[e; @embed["Başlık"; "Açıklama"; 3461339; "Alt yazı"]]
-@var[e; @embed["Başlık"; "Açıklama"; ""; "Alt yazı"; "img.png"; "thumb.png"; "Yazar"]]
+@discord.hybrid[userinfo; ctx; member]
+    @discord.reply[ctx; member.display_name]
+@end
 ```
 
-**Kwargs** (sırasız, sadece istediğin alanı yaz):
+**Link buttons** — buttons that open a URL have no callback, so the body is
+empty (but, like every block, it still closes with `@end`):
+
 ```clpy
-@var[e; @embed["Başlık"; "Açıklama"; color=3461339; footer="Alt"; author="Bot"]]
-@var[e; @embed["Başlık"; "Açıklama"; footer="Alt"; footer_icon="icon.png"]]
-@var[e; @embed["Başlık"; "Açıklama"; author="Yazar"; author_icon="avatar.png"]]
+@discord.view[Links]
+    @discord.button[Docs; url="https://example.com"; emoji="📖"]
+    @end
+    @discord.button[Press; style=green]
+        @discord.respond[interaction; "pressed"]
+    @end
+@end
 ```
 
-**Doğrudan gönder** (değişkene atamadan):
+**Slash autocomplete** — suggest options as the user types. Inside the
+callback, `current` holds the partial text:
+
 ```clpy
-@discord.send_embed[ctx.channel; @embed["Başlık"; "Açıklama"; footer="Alt"]]
+@discord.slash[fruit; "Pick a fruit"; interaction]
+    @param[name; string; "Fruit name"]
+    @autocomplete[name]
+        @return[[discord.app_commands.Choice(name=x, value=x)
+                 for x in FRUITS if current.lower() in x.lower()]]
+    @end
+    @discord.respond[interaction; name]
+@end
 ```
 
-**Not — renk:** Cruhon'un tokenizer'ı hex literalleri (`0x3498db`) boşlukla böler.
-Rengi ondalık olarak ver (`3461339`) ya da kwarg formunda: `color=0x3498db`
-bu da çalışır çünkü kwarg değeri ham string olarak alınır.
+**Modal forms** — `@discord.send_modal[interaction; FormClass]` opens a modal
+defined with `@discord.modal`.
 
-Ayrıca `@discord.quick_embed[...]` de aynı şeyi yapar (`@discord.` önekiyle).
+## @embed — Easy Embed Creation
 
-## Kaçış kapağı (escape hatch)
+One-liner full embed. Two syntaxes supported:
 
-Bir komut yetmezse `@raw` ile saf discord.py yazabilirsin — bot nesnesi
-`__bot__` adıyla erişilebilir:
+**Positional** (order: title → description → color → footer → image → thumbnail → author):
+```clpy
+@var[e; @embed["Title"; "Description"]]
+@var[e; @embed["Title"; "Description"; 3461339; "Footer"]]
+@var[e; @embed["Title"; "Description"; ""; "Footer"; "img.png"; "thumb.png"; "Author"]]
+```
+
+**Kwargs** (any order, only the fields you need):
+```clpy
+@var[e; @embed["Title"; "Description"; color=3461339; footer="Footer"; author="Bot"]]
+@var[e; @embed["Title"; "Description"; footer="Footer"; footer_icon="icon.png"]]
+@var[e; @embed["Title"; "Description"; author="Author"; author_icon="avatar.png"]]
+```
+
+**Send directly** (no variable needed):
+```clpy
+@discord.send_embed[ctx.channel; @embed["Title"; "Description"; footer="Footer"]]
+```
+
+**Note — color:** Cruhon's tokenizer splits hex literals (`0x3498db`) at spaces.
+Pass color as a decimal (`3461339`) or use kwarg form: `color=0x3498db`
+also works because the kwarg value is taken as a raw string.
+
+`@discord.quick_embed[...]` does the same thing (with `@discord.` prefix).
+
+## Escape Hatch
+
+If a command isn't enough, use `@raw` to write plain discord.py — the bot
+object is accessible as `__bot__`:
 
 ```clpy
 @raw
     @__bot__.command()
-    async def gelismis(ctx, *args):
-        # tam discord.py gücü
+    async def advanced(ctx, *args):
+        # full discord.py power
         ...
 @end
 ```
 
-## Gereksinim
+## Requirements
 
-`pip install discord.py` — bot kodu çalıştırılırken gerekir.
-Transpile (kod üretimi) için gerekmez.
+`pip install discord.py` — required when running bot code.
+Not required for transpilation (code generation).

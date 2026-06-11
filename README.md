@@ -5,27 +5,6 @@ By [CrucibleLab](https://github.com/cruciblelab) · `.clpy` files · MIT License
 
 ---
 
-## ⚠️ Trademark Notice
-
-"Cruhon" and "Crucible" are trademarks of Crucible Lab.
-
-**Any fork, derivative work, or redistribution MUST retain "Cruhon" in its name.**
-
-✓ **Allowed:** "Cruhon Maxi", "Cruhon X", "Cruhon Community", "Cruhon Turkish"  
-✗ **Not allowed:** "Python Language", "MyScript", "FastScript"
-
-**Requirements:**
-- Redistributions must include "Cruhon" in the name
-- Must retain attribution to Crucible Lab in documentation/README
-- Do not claim official endorsement without permission
-
-Violations of this trademark notice may result in legal action.
-
----
-
-## Features
-...
-
 ## What is Cruhon?
 
 Cruhon is a scripting language that compiles to Python. It replaces Python's
