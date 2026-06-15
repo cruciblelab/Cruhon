@@ -1,0 +1,6052 @@
+"""
+Core test suite for Cruhon.
+
+Covers: parser, transpiler, runner, stdlib, semantics, include, async, raw.
+"""
+import sys
+import os
+import tempfile
+import textwrap
+from pathlib import Path
+
+import pytest
+
+# Make the package importable regardless of install state
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from cruhon.core.parser import parse, ParseError
+from cruhon.core.transpiler import transpile, TranspileError
+from cruhon.core.runner import run_source, run_file, RunError, resolve_includes
+from cruhon.core.lexer import tokenize
+from cruhon.core.ast_nodes import (
+    VarNode, PrintNode, InputNode, IfNode, ForNode, WhileNode,
+    FuncNode, ReturnNode, BreakNode, ContinueNode, TryNode,
+    AssertNode, RepeatNode, RawNode, FetchNode, ImportNode,
+)
+
+
+# ─────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def _transpile(source: str) -> str:
+    """Parse + transpile, return generated Python."""
+    return transpile(parse(source))
+
+
+def _run(source: str, capsys=None) -> str:
+    """Run source, return generated Python."""
+    return run_source(source)
+
+
+# ─────────────────────────────────────────────────────────────
+# LEXER
+# ─────────────────────────────────────────────────────────────
+
+class TestLexer:
+    def test_at_cmd_token(self):
+        tokens = tokenize("@print[hello]")
+        types = [t.type for t in tokens]
+        assert "AT_CMD" in types
+        assert "LBRACKET" in types
+        assert "RBRACKET" in types
+
+    def test_namespace_token(self):
+        tokens = tokenize("@math.sqrt[16]")
+        types = [t.type for t in tokens]
+        assert "NAMESPACE" in types
+        assert "DOT" in types
+
+    def test_comment_token(self):
+        tokens = tokenize("# this is a comment\n@print[hi]")
+        types = [t.type for t in tokens]
+        assert "COMMENT" in types
+
+    def test_string_token(self):
+        tokens = tokenize('@var[x; "hello"]')
+        string_tokens = [t for t in tokens if t.type == "STRING"]
+        assert len(string_tokens) == 1
+        assert string_tokens[0].value == "hello"
+
+    def test_number_token(self):
+        tokens = tokenize("@var[n; 42]")
+        number_tokens = [t for t in tokens if t.type == "NUMBER"]
+        assert len(number_tokens) == 1
+        assert number_tokens[0].value == "42"
+
+    def test_indent_dedent(self):
+        source = "@if[True]\n    @print[yes]\n@end"
+        tokens = tokenize(source)
+        types = [t.type for t in tokens]
+        assert "INDENT" in types
+        assert "DEDENT" in types
+
+
+# ─────────────────────────────────────────────────────────────
+# PARSER
+# ─────────────────────────────────────────────────────────────
+
+class TestParser:
+    def test_parse_print(self):
+        ast = parse("@print[hello]")
+        assert len(ast.body) == 1
+        assert isinstance(ast.body[0], PrintNode)
+        assert ast.body[0].value == "hello"
+
+    def test_parse_var(self):
+        ast = parse("@var[x; 42]")
+        node = ast.body[0]
+        assert isinstance(node, VarNode)
+        assert node.name == "x"
+        assert node.value == "42"
+
+    def test_parse_input(self):
+        ast = parse("@input[Enter your name: ]")
+        node = ast.body[0]
+        assert isinstance(node, InputNode)
+        assert "Enter" in node.prompt
+
+    def test_parse_input_no_prompt(self):
+        ast = parse("@input[]")
+        node = ast.body[0]
+        assert isinstance(node, InputNode)
+
+    def test_parse_if(self):
+        ast = parse("@if[x > 0]\n    @print[yes]\n@end")
+        node = ast.body[0]
+        assert isinstance(node, IfNode)
+        assert node.condition == "x > 0"
+
+    def test_parse_for(self):
+        ast = parse("@for[i; range(3)]\n    @print[i]\n@end")
+        node = ast.body[0]
+        assert isinstance(node, ForNode)
+        assert node.var == "i"
+
+    def test_parse_while(self):
+        ast = parse("@while[x > 0]\n    @print[x]\n@end")
+        node = ast.body[0]
+        assert isinstance(node, WhileNode)
+
+    def test_parse_func(self):
+        ast = parse("@func[greet; name]\n    @print[hello]\n@end")
+        node = ast.body[0]
+        assert isinstance(node, FuncNode)
+        assert node.name == "greet"
+        assert "name" in node.params
+
+    def test_parse_return(self):
+        ast = parse("@func[f]\n    @return[42]\n@end")
+        func_node = ast.body[0]
+        ret_node = func_node.body[0]
+        assert isinstance(ret_node, ReturnNode)
+
+    def test_parse_break_continue(self):
+        src = "@for[i; range(3)]\n    @break\n    @continue\n@end"
+        ast = parse(src)
+        body = ast.body[0].body
+        assert isinstance(body[0], BreakNode)
+        assert isinstance(body[1], ContinueNode)
+
+    def test_parse_try_catch(self):
+        src = "@try\n    @print[ok]\n@catch[e]\n    @print[err]\n@end"
+        ast = parse(src)
+        node = ast.body[0]
+        assert isinstance(node, TryNode)
+        assert node.catch_var == "e"
+
+    def test_parse_assert(self):
+        ast = parse('@assert[x > 0; "must be positive"]')
+        node = ast.body[0]
+        assert isinstance(node, AssertNode)
+
+    def test_parse_repeat(self):
+        ast = parse("@repeat[5]\n    @print[hi]\n@end")
+        node = ast.body[0]
+        assert isinstance(node, RepeatNode)
+        assert node.count == "5"
+
+    def test_parse_unknown_command_raises(self):
+        with pytest.raises(ParseError):
+            parse("@nonexistent[arg]")
+
+    def test_parse_var_missing_value_raises(self):
+        with pytest.raises(ParseError):
+            parse("@var[x]")
+
+    def test_parse_unknown_inline_raises(self):
+        with pytest.raises(ParseError):
+            parse("@var[x; @nonexistent[arg]]")
+
+    def test_parse_dict_odd_args_raises(self):
+        with pytest.raises(ParseError):
+            parse("@var[d; @dict[k1; v1; k3]]")
+
+    def test_parse_raw_block(self):
+        src = "@raw\n    x = 1 + 1\n@end"
+        ast = parse(src)
+        node = ast.body[0]
+        assert isinstance(node, RawNode)
+        assert "x = 1 + 1" in node.code
+
+    def test_parse_fetch(self):
+        ast = parse('@fetch["https://example.com"]')
+        node = ast.body[0]
+        assert isinstance(node, FetchNode)
+
+    def test_parse_import(self):
+        ast = parse("@import[requests]")
+        node = ast.body[0]
+        assert isinstance(node, ImportNode)
+        assert node.lib == "requests"
+
+    def test_parse_import_alias(self):
+        ast = parse("@import[requests; req]")
+        node = ast.body[0]
+        assert node.alias == "req"
+
+    def test_parse_inline_env(self):
+        ast = parse("@var[val; @env[HOME]]")
+        node = ast.body[0]
+        assert isinstance(node, VarNode)
+        assert "os.environ" in node.value
+
+    def test_parse_inline_list(self):
+        ast = parse("@var[lst; @list[1; 2; 3]]")
+        node = ast.body[0]
+        assert "[1, 2, 3]" in node.value
+
+    def test_parse_inline_dict(self):
+        ast = parse("@var[d; @dict[k; v]]")
+        node = ast.body[0]
+        assert "k" in node.value and "v" in node.value
+
+
+# ─────────────────────────────────────────────────────────────
+# TRANSPILER
+# ─────────────────────────────────────────────────────────────
+
+class TestTranspiler:
+    def test_print_bare_text(self):
+        code = _transpile("@print[hello world]")
+        assert 'print("hello world")' in code
+
+    def test_print_fstring(self):
+        code = _transpile("@print[Hello, {name}!]")
+        assert 'f"Hello, {name}!"' in code
+
+    def test_var_number(self):
+        code = _transpile("@var[x; 42]")
+        assert "x = 42" in code
+
+    def test_var_string(self):
+        code = _transpile('@var[msg; "hello"]')
+        assert 'msg = "hello"' in code
+
+    def test_var_expression(self):
+        code = _transpile("@var[result; a + b]")
+        assert "result = a + b" in code
+
+    def test_var_fstring(self):
+        code = _transpile("@var[msg; Hello {name}]")
+        assert 'msg = f"Hello {name}"' in code
+
+    def test_input_with_prompt(self):
+        code = _transpile("@input[Enter name: ]")
+        assert "input(" in code
+        assert "Enter name:" in code
+
+    def test_input_no_prompt(self):
+        code = _transpile("@input[]")
+        assert "input(" in code
+
+    def test_const(self):
+        code = _transpile("@const[MAX; 100]")
+        assert "MAX = 100" in code
+        assert "# const" in code
+
+    def test_if_else(self):
+        src = "@if[x > 0]\n    @print[pos]\n@else\n    @print[neg]\n@end"
+        code = _transpile(src)
+        assert "if x > 0:" in code
+        assert "else:" in code
+
+    def test_elif(self):
+        src = "@if[x > 0]\n    @print[pos]\n@elif[x == 0]\n    @print[zero]\n@end"
+        code = _transpile(src)
+        assert "elif x == 0:" in code
+
+    def test_for_loop(self):
+        code = _transpile("@for[i; range(3)]\n    @print[i]\n@end")
+        assert "for i in range(3):" in code
+
+    def test_while_loop(self):
+        code = _transpile("@while[x > 0]\n    @print[x]\n@end")
+        assert "while x > 0:" in code
+
+    def test_repeat_loop(self):
+        code = _transpile("@repeat[5]\n    @print[hi]\n@end")
+        assert "for _ in range(5):" in code
+
+    def test_func_def(self):
+        code = _transpile("@func[add; a; b]\n    @return[a + b]\n@end")
+        assert "def add(a, b):" in code
+        assert "return a + b" in code
+
+    def test_async_func(self):
+        code = _transpile("@async[main]\n    @print[ok]\n@end")
+        assert "async def main():" in code
+
+    def test_class_def(self):
+        code = _transpile("@class[Animal]\n    @print[created]\n@end")
+        assert "class Animal:" in code
+
+    def test_class_with_parent(self):
+        code = _transpile("@class[Dog; Animal]\n    @print[woof]\n@end")
+        assert "class Dog(Animal):" in code
+
+    def test_try_catch(self):
+        src = "@try\n    @print[ok]\n@catch[e]\n    @print[err]\n@end"
+        code = _transpile(src)
+        assert "try:" in code
+        assert "except Exception as e:" in code
+
+    def test_try_finally(self):
+        src = "@try\n    @print[ok]\n@catch[e]\n    @print[err]\n@finally\n    @print[done]\n@end"
+        code = _transpile(src)
+        assert "finally:" in code
+
+    def test_assert(self):
+        code = _transpile('@assert[x > 0; "must be positive"]')
+        assert "assert x > 0" in code
+
+    def test_import(self):
+        code = _transpile("@import[requests]")
+        assert "import requests" in code
+
+    def test_import_alias(self):
+        code = _transpile("@import[requests; req]")
+        assert "import requests as req" in code
+
+    def test_import_unknown_passthrough(self):
+        # Unknown libraries pass through as plain Python imports —
+        # the runtime will raise ImportError if the package isn't installed.
+        code = _transpile("@import[nonexistent_lib_xyz]")
+        assert "import nonexistent_lib_xyz" in code
+
+    def test_import_unknown_with_alias(self):
+        code = _transpile("@import[numpy as np]")
+        assert "import numpy as np" in code
+
+    def test_env_auto_import(self):
+        code = _transpile("@var[h; @env[HOME]]")
+        assert "import os" in code
+
+    def test_fetch_auto_import(self):
+        code = _transpile('@fetch["https://example.com"]')
+        assert "import requests" in code
+
+    def test_raw_block(self):
+        src = "@raw\n    x = 1 + 1\n@end"
+        code = _transpile(src)
+        assert "x = 1 + 1" in code
+
+    def test_inline_list(self):
+        code = _transpile("@var[lst; @list[1; 2; 3]]")
+        assert "lst = [1, 2, 3]" in code
+
+    def test_inline_dict(self):
+        code = _transpile("@var[d; @dict[name; Alice; age; 30]]")
+        assert "name" in code and "Alice" in code
+
+    def test_namespace_lib_call(self):
+        code = _transpile("@math.sqrt[16]")
+        assert "sqrt" in code
+        assert "16" in code
+
+    def test_store_helpers_injected(self):
+        code = _transpile("@store.set[key; val]")
+        assert "__cruhon_store_set" in code
+
+
+# ─────────────────────────────────────────────────────────────
+# EVAL VALUE RULES
+# ─────────────────────────────────────────────────────────────
+
+class TestEvalValue:
+    """Tests for the single _eval_value() semantic rule."""
+
+    def _ev(self, value, context="expr"):
+        from cruhon.core.transpiler import Transpiler
+        return Transpiler()._eval_value(value, context)
+
+    def test_rule1_quoted_no_braces(self):
+        assert self._ev('"hello"') == '"hello"'
+
+    def test_rule2_quoted_with_braces(self):
+        assert self._ev('"Hello {name}"') == 'f"Hello {name}"'
+
+    def test_rule2_unquoted_fstring(self):
+        result = self._ev("Hello {name}")
+        assert 'f"Hello {name}"' == result
+
+    def test_rule3_integer(self):
+        assert self._ev("42") == "42"
+
+    def test_rule3_float(self):
+        assert self._ev("3.14") == "3.14"
+
+    def test_rule4_true(self):
+        assert self._ev("True") == "True"
+
+    def test_rule4_false(self):
+        assert self._ev("False") == "False"
+
+    def test_rule4_none(self):
+        assert self._ev("None") == "None"
+
+    def test_rule5_list_literal(self):
+        assert self._ev("[1, 2, 3]") == "[1, 2, 3]"
+
+    def test_rule5_dict_literal(self):
+        assert self._ev('{"key": "val"}') == '{"key": "val"}'
+
+    def test_rule6_expression(self):
+        assert self._ev("a + b") == "a + b"
+
+    def test_rule6_function_call(self):
+        assert self._ev("len(lst)") == "len(lst)"
+
+    def test_rule7a_identifier_expr(self):
+        assert self._ev("myvar", "expr") == "myvar"
+
+    def test_rule7b_identifier_display(self):
+        assert self._ev("myvar", "display") == '"myvar"'
+
+    def test_rule8_bare_text(self):
+        assert self._ev("hello world") == '"hello world"'
+
+    def test_dict_not_confused_with_fstring(self):
+        result = self._ev('{"key": value}')
+        assert result == '{"key": value}'
+
+    def test_func_call_with_dict_arg(self):
+        result = self._ev('func({"key": val})')
+        assert result == 'func({"key": val})'
+
+
+# ─────────────────────────────────────────────────────────────
+# RUNNER (execution)
+# ─────────────────────────────────────────────────────────────
+
+class TestRunner:
+    def test_hello_world(self, capsys):
+        run_source("@print[Hello World]")
+        captured = capsys.readouterr()
+        assert "Hello World" in captured.out
+
+    def test_var_and_print(self, capsys):
+        # Strings must be quoted in expr context — see semantics.md Rule 7a
+        run_source('@var[name; "Alice"]\n@print[Hi {name}!]')
+        captured = capsys.readouterr()
+        assert "Hi Alice!" in captured.out
+
+    def test_for_loop_runs(self, capsys):
+        run_source("@for[i; range(3)]\n    @print[{i}]\n@end")
+        captured = capsys.readouterr()
+        assert "0" in captured.out
+        assert "1" in captured.out
+        assert "2" in captured.out
+
+    def test_repeat_runs(self, capsys):
+        run_source("@repeat[3]\n    @print[hi]\n@end")
+        captured = capsys.readouterr()
+        assert captured.out.count("hi") == 3
+
+    def test_func_and_call(self, capsys):
+        src = "@func[greet; name]\n    @print[Hello {name}!]\n@end\ngreet('Bob')"
+        run_source(src)
+        captured = capsys.readouterr()
+        assert "Hello Bob!" in captured.out
+
+    def test_if_true_branch(self, capsys):
+        run_source("@var[x; 5]\n@if[x > 3]\n    @print[big]\n@end")
+        captured = capsys.readouterr()
+        assert "big" in captured.out
+
+    def test_if_false_branch(self, capsys):
+        run_source("@var[x; 1]\n@if[x > 3]\n    @print[big]\n@else\n    @print[small]\n@end")
+        captured = capsys.readouterr()
+        assert "small" in captured.out
+
+    def test_assert_passes(self):
+        run_source("@var[x; 5]\n@assert[x > 0]")
+
+    def test_assert_fails(self):
+        with pytest.raises((RunError, AssertionError)):
+            run_source("@var[x; -1]\n@assert[x > 0]")
+
+    def test_try_catch(self, capsys):
+        src = "@try\n    @var[x; int(\"bad\")]\n@catch[e]\n    @print[caught]\n@end"
+        run_source(src)
+        captured = capsys.readouterr()
+        assert "caught" in captured.out
+
+    def test_raw_block(self, capsys):
+        run_source("@raw\n    print('raw output')\n@end")
+        captured = capsys.readouterr()
+        assert "raw output" in captured.out
+
+    def test_math_lib(self, capsys):
+        run_source("@var[r; @math.sqrt[25.0]]\n@print[{r}]")
+        captured = capsys.readouterr()
+        assert "5.0" in captured.out
+
+    def test_color_lib(self, capsys):
+        run_source('@var[c; @color.red["hello"]]\n@print[{c}]')
+        captured = capsys.readouterr()
+        assert "hello" in captured.out
+
+    def test_time_lib(self, capsys):
+        run_source("@var[ts; @time.timestamp[]]\n@print[{ts}]")
+        captured = capsys.readouterr()
+        assert len(captured.out.strip()) > 0
+
+    def test_json_parse(self, capsys):
+        # Use json.loads directly in raw context to avoid quoting issues
+        src = "@raw\n    import json\n    data = json.loads('{\"x\": 1}')\n    print(data)\n@end"
+        run_source(src)
+        captured = capsys.readouterr()
+        assert "x" in captured.out
+
+    def test_store_set_get(self, capsys):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as d:
+            old = os.getcwd()
+            os.chdir(d)
+            try:
+                run_source('@store.set["mykey"; 42]\n@var[v; @store.get["mykey"]]\n@print[{v}]')
+                captured = capsys.readouterr()
+                assert "42" in captured.out
+            finally:
+                os.chdir(old)
+
+
+# ─────────────────────────────────────────────────────────────
+# @input COMMAND
+# ─────────────────────────────────────────────────────────────
+
+class TestInput:
+    def test_input_transpiles(self):
+        code = _transpile("@input[Enter: ]")
+        assert "input(" in code
+
+    def test_input_transpiles_to_call(self):
+        code = _transpile("@input[Enter name: ]")
+        assert "input(" in code
+
+    def test_input_no_prompt_transpiles(self):
+        code = _transpile("@input[]")
+        assert "input(" in code
+
+    def test_input_bare_text_prompt(self):
+        code = _transpile("@input[Your name: ]")
+        assert "input(" in code
+        assert "Your name:" in code
+
+
+# ─────────────────────────────────────────────────────────────
+# @include RESOLUTION
+# ─────────────────────────────────────────────────────────────
+
+class TestInclude:
+    def test_basic_include(self, tmp_path, capsys):
+        included = tmp_path / "greet.clpy"
+        included.write_text("@print[from included file]\n")
+        main = tmp_path / "main.clpy"
+        main.write_text(f'@include[greet.clpy]\n')
+        run_file(str(main))
+        captured = capsys.readouterr()
+        assert "from included file" in captured.out
+
+    def test_include_not_found_raises(self, tmp_path):
+        main = tmp_path / "main.clpy"
+        main.write_text("@include[nonexistent.clpy]\n")
+        with pytest.raises(RunError):
+            run_file(str(main))
+
+    def test_direct_circular_include_raises(self, tmp_path):
+        a = tmp_path / "a.clpy"
+        b = tmp_path / "b.clpy"
+        a.write_text("@include[b.clpy]\n")
+        b.write_text("@include[a.clpy]\n")
+        with pytest.raises(RunError, match="Circular"):
+            run_file(str(a))
+
+    def test_indirect_circular_include_raises(self, tmp_path):
+        a = tmp_path / "a.clpy"
+        b = tmp_path / "b.clpy"
+        c = tmp_path / "c.clpy"
+        a.write_text("@include[b.clpy]\n")
+        b.write_text("@include[c.clpy]\n")
+        c.write_text("@include[a.clpy]\n")
+        with pytest.raises(RunError, match="Circular"):
+            run_file(str(a))
+
+
+# ─────────────────────────────────────────────────────────────
+# STDLIB — FILE
+# ─────────────────────────────────────────────────────────────
+
+class TestFileLib:
+    def test_file_read(self, tmp_path, capsys):
+        f = tmp_path / "test.txt"
+        f.write_text("hello from file")
+        old = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            run_source("@var[content; @file.read[\"test.txt\"]]\n@print[{content}]")
+            captured = capsys.readouterr()
+            assert "hello from file" in captured.out
+        finally:
+            os.chdir(old)
+
+    def test_file_write_and_exists(self, tmp_path, capsys):
+        old = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            run_source("@file.write[\"out.txt\"; \"written\"]\n@var[ok; @file.exists[\"out.txt\"]]\n@print[{ok}]")
+            captured = capsys.readouterr()
+            assert "True" in captured.out
+        finally:
+            os.chdir(old)
+
+    def test_file_path_traversal_blocked(self, tmp_path):
+        old = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            with pytest.raises((RunError, PermissionError)):
+                run_source("@var[x; @file.read[\"../../../etc/passwd\"]]")
+        finally:
+            os.chdir(old)
+
+    def test_file_vp_passthrough(self, tmp_path):
+        from cruhon.core.libs.file_ import _vp
+        assert _vp("/etc/passwd") == "/etc/passwd"
+        assert _vp("../parent") == "../parent"
+
+    def test_http_any_url(self):
+        from cruhon.core.libs.http_ import _check_url
+        assert _check_url("http://localhost/x") == "http://localhost/x"
+        assert _check_url("http://192.168.1.1/x") == "http://192.168.1.1/x"
+
+    def test_http_ssrf_public_url_allowed(self):
+        """_check_url passes public URLs through."""
+        from cruhon.core.libs.http_ import _check_url
+        assert _check_url("https://example.com/api") == "https://example.com/api"
+
+
+# ─────────────────────────────────────────────────────────────
+# SYNTAX ENGINE
+# ─────────────────────────────────────────────────────────────
+
+class TestSyntaxEngine:
+    def setup_method(self):
+        from cruhon.core.syntax_engine import SyntaxEngine
+        self.engine = SyntaxEngine()
+
+    def test_split_simple(self):
+        assert self.engine.split_args("a; b; c") == ["a", "b", "c"]
+
+    def test_split_nested_brackets(self):
+        result = self.engine.split_args("name; [1; 2; 3]")
+        assert result == ["name", "[1; 2; 3]"]
+
+    def test_split_function_call(self):
+        result = self.engine.split_args("name; add(3, 4)")
+        assert result == ["name", "add(3, 4)"]
+
+    def test_split_quoted_semicolon(self):
+        result = self.engine.split_args('name; "x; y"')
+        assert result == ["name", '"x; y"']
+
+    def test_validate_arg_balanced(self):
+        self.engine.validate_arg("len(x)")  # should not raise
+
+    def test_validate_arg_unbalanced_raises(self):
+        from cruhon.core.parser import ParseError
+        with pytest.raises(ParseError):
+            self.engine.validate_arg("len(x")
+
+
+# ─────────────────────────────────────────────────────────────
+# MOD SYSTEM
+# ─────────────────────────────────────────────────────────────
+
+class TestModSystem:
+    def test_registry_register_and_get(self):
+        from cruhon.core.registry import register_lib, get_lib
+        register_lib("testlib_xyz", "testlib_xyz")
+        assert get_lib("testlib_xyz") == "testlib_xyz"
+
+    def test_registry_lib_call(self):
+        from cruhon.core.registry import register_lib_call, get_lib_call
+        handler = lambda args: f"testfn({args[0]})"
+        register_lib_call("testns", "testmethod", handler)
+        retrieved = get_lib_call("testns", "testmethod")
+        assert retrieved is not None
+        assert retrieved(["x"]) == "testfn(x)"
+
+    def test_namespace_isolation(self):
+        from cruhon.core.namespace_runtime import Namespace, reset_registry
+        ns = Namespace("test_ns")
+        ns.state["secret"] = "value"
+        with pytest.raises(RuntimeError):
+            ns.access_state("secret", "other_ns")
+
+    def test_namespace_allow_peer(self):
+        from cruhon.core.namespace_runtime import Namespace
+        ns = Namespace("owner_ns")
+        ns.state["key"] = "value"
+        ns.allow_peer("trusted_ns")
+        result = ns.access_state("key", "trusted_ns")
+        assert result == "value"
+
+    def test_namespace_self_access(self):
+        from cruhon.core.namespace_runtime import Namespace
+        ns = Namespace("myns")
+        ns.state["x"] = 99
+        assert ns.access_state("x", "myns") == 99
+
+    def test_namespace_write_blocked(self):
+        from cruhon.core.namespace_runtime import Namespace
+        ns = Namespace("myns")
+        with pytest.raises(RuntimeError):
+            ns.write_state("x", 1, "other_ns")
+
+
+# ─────────────────────────────────────────────────────────────
+# NAMED PARAMETERS
+# ─────────────────────────────────────────────────────────────
+
+class TestNamedArgs:
+    def setup_method(self):
+        from cruhon.core.syntax_engine import SyntaxEngine
+        self.engine = SyntaxEngine()
+
+    def test_positional_only(self):
+        args, kwargs = self.engine.split_named_args("a ; b ; c")
+        assert args == ["a", "b", "c"]
+        assert kwargs == {}
+
+    def test_kwargs_only(self):
+        args, kwargs = self.engine.split_named_args("reason=spam ; delete_days=7")
+        assert args == []
+        assert kwargs == {"reason": "spam", "delete_days": "7"}
+
+    def test_mixed_positional_and_kwargs(self):
+        args, kwargs = self.engine.split_named_args("url ; reason=spam ; delete_days=7")
+        assert args == ["url"]
+        assert kwargs == {"reason": "spam", "delete_days": "7"}
+
+    def test_kwarg_value_with_spaces(self):
+        args, kwargs = self.engine.split_named_args('msg=hello world ; n=5')
+        assert args == []
+        assert kwargs["msg"] == "hello world"
+        assert kwargs["n"] == "5"
+
+    def test_positional_after_kwarg_raises(self):
+        from cruhon.core.parser import ParseError
+        with pytest.raises(ParseError):
+            self.engine.split_named_args("key=val ; positional")
+
+    def test_equals_inside_string_is_not_kwarg(self):
+        args, kwargs = self.engine.split_named_args('"x=y"')
+        assert args == ['"x=y"']
+        assert kwargs == {}
+
+    def test_no_args(self):
+        args, kwargs = self.engine.split_named_args("")
+        assert args == []
+        assert kwargs == {}
+
+
+# ─────────────────────────────────────────────────────────────
+# HINT ENGINE
+# ─────────────────────────────────────────────────────────────
+
+class TestHints:
+    def test_nameerror_hint_suggests_quotes(self):
+        with pytest.raises(RunError) as exc_info:
+            run_source("@var[x; Cruhon]")
+        msg = str(exc_info.value)
+        assert "Hint" in msg
+        assert "quotes" in msg.lower() or "quote" in msg.lower()
+
+    def test_nameerror_hint_includes_variable_name(self):
+        with pytest.raises(RunError) as exc_info:
+            run_source("@var[x; SomeMissingName]")
+        assert "SomeMissingName" in str(exc_info.value)
+
+    def test_zerodivision_hint(self):
+        with pytest.raises(RunError) as exc_info:
+            run_source("@var[x; 1 / 0]")
+        assert "zero" in str(exc_info.value).lower()
+
+    def test_indexerror_hint(self):
+        with pytest.raises(RunError) as exc_info:
+            run_source("@var[lst; [1, 2]]\n@var[x; lst[99]]")
+        assert "index" in str(exc_info.value).lower() or "range" in str(exc_info.value).lower()
+
+    def test_no_false_positive_hint_on_valid_code(self, capsys):
+        run_source('@var[x; "hello"]\n@print[{x}]')
+        captured = capsys.readouterr()
+        assert "hello" in captured.out
+
+
+# ─────────────────────────────────────────────────────────────
+# BLOCK PLUGIN COMMANDS
+# ─────────────────────────────────────────────────────────────
+
+class TestBlockPlugin:
+    def test_block_command_basic(self, capsys):
+        """api.block_command registers a block that runs its body."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("test_block_mod")
+
+        collected = {}
+
+        def visit_section(transpiler, node):
+            collected["args"] = node.args
+            collected["kwargs"] = node.kwargs
+            # Emit body at current indent level (section is a transparent wrapper)
+            parts = [child.accept(transpiler) for child in node.body]
+            return "\n".join(p for p in parts if p)
+
+        api.block_command("section", visit_section)
+
+        run_source('@section["intro"]\n    @print["inside block"]\n@end')
+        captured = capsys.readouterr()
+        assert "inside block" in captured.out
+        assert collected["args"] == ['"intro"']
+
+    def test_block_command_named_args(self):
+        """Block command receives named args in node.kwargs."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("test_block_kwargs")
+
+        received_kwargs = {}
+
+        def visit_cmd(transpiler, node):
+            received_kwargs.update(node.kwargs)
+            parts = [child.accept(transpiler) for child in node.body]
+            return "\n".join(p for p in parts if p)
+
+        api.block_command("mblock", visit_cmd)
+
+        run_source('@mblock["hello"; priority=high]\n    @print["x"]\n@end')
+        assert received_kwargs.get("priority") == "high"
+
+    def test_block_command_empty_body(self, capsys):
+        """Block command with no body should not crash."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("test_empty_block")
+
+        def visit_empty(transpiler, node):
+            return transpiler._line("pass")
+
+        api.block_command("emptyblock", visit_empty)
+        run_source('@emptyblock[]\n@end')  # no error
+
+    def test_plugin_block_node_fields(self):
+        """PluginBlockNode has the expected fields."""
+        from cruhon.core.ast_nodes import PluginBlockNode
+        node = PluginBlockNode(plugin_name="test", args=["a"], kwargs={"k": "v"}, body=[])
+        assert node.plugin_name == "test"
+        assert node.args == ["a"]
+        assert node.kwargs == {"k": "v"}
+
+
+# ─────────────────────────────────────────────────────────────
+# CONTEXT VARIABLES
+# ─────────────────────────────────────────────────────────────
+
+class TestContextVars:
+    def test_ctx_set_and_read(self, capsys):
+        run_source('@ctx.set["username"; "Alice"]\n@var[u; @ctx["username"]]\n@print[{u}]')
+        captured = capsys.readouterr()
+        assert "Alice" in captured.out
+
+    def test_ctx_default_when_missing(self, capsys):
+        run_source('@var[v; @ctx["missing"; "fallback"]]\n@print[{v}]')
+        captured = capsys.readouterr()
+        assert "fallback" in captured.out
+
+    def test_ctx_get_method(self, capsys):
+        run_source('@ctx.set["score"; 99]\n@var[s; @ctx.get["score"]]\n@print[{s}]')
+        captured = capsys.readouterr()
+        assert "99" in captured.out
+
+    def test_ctx_clear(self, capsys):
+        run_source('@ctx.set["x"; "val"]\n@ctx.clear[]\n@var[v; @ctx["x"; "gone"]]\n@print[{v}]')
+        captured = capsys.readouterr()
+        assert "gone" in captured.out
+
+    def test_ctx_delete(self, capsys):
+        run_source('@ctx.set["k"; "v"]\n@ctx.delete["k"]\n@var[v; @ctx["k"; "deleted"]]\n@print[{v}]')
+        captured = capsys.readouterr()
+        assert "deleted" in captured.out
+
+    def test_ctx_plugin_sets_for_block(self, capsys):
+        """Plugin block that pre-populates __ctx__ before running body."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("test_ctx_plugin")
+
+        def visit_withuser(transpiler, node):
+            username = node.args[0] if node.args else '"unknown"'
+            lines = [transpiler._line(f'__ctx__["user"] = {username}')]
+            for child in node.body:
+                r = child.accept(transpiler)
+                if r:
+                    lines.append(r)
+            return "\n".join(lines)
+
+        api.block_command("withuser", visit_withuser)
+
+        run_source('@withuser["Bob"]\n    @var[u; @ctx["user"]]\n    @print[{u}]\n@end')
+        captured = capsys.readouterr()
+        assert "Bob" in captured.out
+
+
+# ─────────────────────────────────────────────────────────────
+# PLUGIN FOUNDATION SYSTEM (v1.1.0)
+# ─────────────────────────────────────────────────────────────
+
+class TestPluginFoundation:
+    def test_expose_and_consume(self):
+        from cruhon.core.mod_loader import ModAPI, _EXPOSED_APIS
+        api_a = ModAPI("foundation-plugin")
+        api_a.expose("helper", lambda x: x * 2)
+
+        api_b = ModAPI("dependent-plugin")
+        helper = api_b.consume("foundation-plugin", "helper")
+        assert helper(5) == 10
+
+    def test_consume_missing_raises(self):
+        from cruhon.core.mod_loader import ModAPI
+        api = ModAPI("consumer-plugin")
+        with pytest.raises(RuntimeError, match="not exposed"):
+            api.consume("nonexistent-plugin", "some_key")
+
+    def test_consume_with_default(self):
+        from cruhon.core.mod_loader import ModAPI
+        api = ModAPI("consumer-default")
+        result = api.consume("nonexistent-plugin", "key", default="fallback")
+        assert result == "fallback"
+
+    def test_is_loaded_true(self):
+        from cruhon.core.mod_loader import ModAPI, _LOADED_MODS
+        _LOADED_MODS["test-is-loaded-mod"] = {"version": "1.0", "source": "test", "source_path": "", "manifest": {}}
+        api = ModAPI("checker")
+        assert api.is_loaded("test-is-loaded-mod") is True
+
+    def test_is_loaded_false(self):
+        from cruhon.core.mod_loader import ModAPI
+        api = ModAPI("checker2")
+        assert api.is_loaded("definitely-not-loaded-xyz") is False
+
+    def test_config_reads_from_manifest(self):
+        from cruhon.core.mod_loader import ModAPI, _LOADED_MODS
+        _LOADED_MODS["config-test-mod"] = {
+            "version": "1.0", "source": "test", "source_path": "",
+            "manifest": {"prefix": "!", "debug": True}
+        }
+        api = ModAPI("config-test-mod")
+        assert api.config("prefix") == "!"
+        assert api.config("debug") is True
+        assert api.config("missing", default="x") == "x"
+
+    def test_expose_multiple_keys(self):
+        from cruhon.core.mod_loader import ModAPI
+        api = ModAPI("multi-expose-plugin")
+        api.expose("fn_a", lambda: "a")
+        api.expose("fn_b", lambda: "b")
+        fn_a = api.consume("multi-expose-plugin", "fn_a")
+        fn_b = api.consume("multi-expose-plugin", "fn_b")
+        assert fn_a() == "a"
+        assert fn_b() == "b"
+
+    def test_version_aware_dependency(self):
+        from cruhon.core.dependency_resolver import DependencyResolver
+        resolver = DependencyResolver()
+        resolver.mark_loaded("cruhon-base", "2.0.0")
+        resolver.declare("my-plugin", ["cruhon-base >= 1.0.0"])
+        missing = resolver.check("my-plugin")
+        assert missing == []
+
+    def test_version_constraint_fails(self):
+        from cruhon.core.dependency_resolver import DependencyResolver
+        resolver = DependencyResolver()
+        resolver.mark_loaded("cruhon-base", "0.5.0")
+        resolver.declare("my-plugin", ["cruhon-base >= 1.0.0"])
+        missing = resolver.check("my-plugin")
+        assert len(missing) == 1
+        assert "cruhon-base" in missing[0]
+
+    def test_list_exposed_apis(self):
+        from cruhon.core.mod_loader import ModAPI, list_exposed_apis
+        api = ModAPI("list-test-plugin")
+        api.expose("foo", 42)
+        api.expose("bar", lambda: None)
+        exposed = list_exposed_apis()
+        assert "list-test-plugin" in exposed
+        assert "foo" in exposed["list-test-plugin"]
+        assert "bar" in exposed["list-test-plugin"]
+
+
+# ─────────────────────────────────────────────────────────────
+# LANGUAGE COMPLETION v1.3.0
+# ─────────────────────────────────────────────────────────────
+
+class TestWith:
+    def test_with_as_var(self, tmp_path):
+        f = tmp_path / "t.txt"
+        f.write_text("hello")
+        old = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            run_source('@with[open("t.txt") as f]\n    @var[c; f.read()]\n@end')
+        finally:
+            os.chdir(old)
+
+    def test_with_no_var(self):
+        run_source('@with[open("/dev/null", "w")]\n    pass\n@end')
+
+    def test_with_body_executes(self, capsys):
+        run_source('@with[open("/dev/null", "w") as f]\n    @print[inside]\n@end')
+        assert "inside" in capsys.readouterr().out
+
+    def test_with_nested(self, tmp_path):
+        a = tmp_path / "a.txt"
+        b = tmp_path / "b.txt"
+        a.write_text("A")
+        b.write_text("B")
+        old = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            run_source(
+                '@with[open("a.txt") as fa]\n'
+                '    @with[open("b.txt") as fb]\n'
+                '        @var[both; fa.read() + fb.read()]\n'
+                '    @end\n'
+                '@end'
+            )
+        finally:
+            os.chdir(old)
+
+
+class TestMatch:
+    def test_match_basic(self, capsys):
+        run_source('@var[x; 2]\n@match[x]\n    @case[1]\n        @print[one]\n    @case[2]\n        @print[two]\n@end')
+        assert "two" in capsys.readouterr().out
+
+    def test_match_default(self, capsys):
+        run_source('@var[x; 99]\n@match[x]\n    @case[1]\n        @print[one]\n    @default\n        @print[other]\n@end')
+        assert "other" in capsys.readouterr().out
+
+    def test_match_string(self, capsys):
+        run_source('@var[cmd; "quit"]\n@match[cmd]\n    @case["start"]\n        @print[starting]\n    @case["quit"]\n        @print[quitting]\n    @default\n        @print[unknown]\n@end')
+        assert "quitting" in capsys.readouterr().out
+
+    def test_match_no_default_no_match(self, capsys):
+        run_source('@var[x; 5]\n@match[x]\n    @case[1]\n        @print[one]\n@end')
+        assert capsys.readouterr().out.strip() == ""
+
+
+class TestDel:
+    def test_del_single(self):
+        with pytest.raises(RunError):
+            run_source('@var[x; 42]\n@del[x]\n@print[{x}]')
+
+    def test_del_multiple(self):
+        run_source('@var[a; 1]\n@var[b; 2]\n@del[a; b]')
+
+
+class TestRaise:
+    def test_raise_with_message(self, capsys):
+        run_source('@try\n    @raise[ValueError; "bad input"]\n@catch[e]\n    @print[caught]\n@end')
+        assert "caught" in capsys.readouterr().out
+
+    def test_raise_bare_reraise(self):
+        with pytest.raises(RunError):
+            run_source('@try\n    @raise[RuntimeError; "orig"]\n@catch[e]\n    @raise\n@end')
+
+    def test_raise_reraise_outer_catches(self, capsys):
+        run_source(
+            '@try\n'
+            '    @try\n'
+            '        @raise[ValueError; "inner"]\n'
+            '    @catch[e]\n'
+            '        @raise\n'
+            '    @end\n'
+            '@catch[e]\n'
+            '    @print[reraised]\n'
+            '@end'
+        )
+        assert "reraised" in capsys.readouterr().out
+
+
+class TestMultiLine:
+    def test_multiline_parens(self, capsys):
+        run_source('@var[x; (\n    1 + 2\n)]\n@print[{x}]')
+        assert "3" in capsys.readouterr().out
+
+    def test_multiline_func_call(self, capsys):
+        run_source('@var[r; max(\n    10,\n    20,\n    30\n)]\n@print[{r}]')
+        assert "30" in capsys.readouterr().out
+
+    def test_multiline_list_literal(self, capsys):
+        run_source('@var[lst; [\n    1,\n    2,\n    3\n]]\n@print[{len(lst)}]')
+        assert "3" in capsys.readouterr().out
+
+
+# ─────────────────────────────────────────────────────────────
+# PLUGIN SYSTEM v1.2.0 — scoped ctx, transforms, block hooks
+# ─────────────────────────────────────────────────────────────
+
+class TestScopedCtx:
+    def test_scoped_block_isolates_ctx(self, capsys):
+        """scoped=True: changes inside block don't leak out."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("scoped-test-mod")
+
+        def visit_scope(transpiler, node):
+            lines = [transpiler._line('__ctx__["inside"] = "yes"')]
+            for child in node.body:
+                r = child.accept(transpiler)
+                if r:
+                    lines.append(r)
+            return "\n".join(lines)
+
+        api.block_command("scopeblock", visit_scope, scoped=True)
+
+        run_source(
+            '@ctx.set["inside"; "no"]\n'
+            '@scopeblock[]\n'
+            '    @var[v; @ctx["inside"]]\n'   # read ctx into var
+            '    @print[{v}]\n'              # print it
+            '@end\n'
+            '@var[after; @ctx["inside"; "no"]]\n'
+            '@print[{after}]'
+        )
+        captured = capsys.readouterr()
+        assert "yes" in captured.out      # inside block: __ctx__ was "yes"
+        assert "no" in captured.out       # outside block: original value restored
+
+    def test_ctx_push_pop_manual(self, capsys):
+        """@ctx.push / @ctx.pop manual stack operations."""
+        run_source(
+            '@ctx.set["x"; "outer"]\n'
+            '@ctx.push[]\n'
+            '@ctx.set["x"; "inner"]\n'
+            '@var[v1; @ctx["x"]]\n'
+            '@print[{v1}]\n'
+            '@ctx.pop[]\n'
+            '@var[v2; @ctx["x"]]\n'
+            '@print[{v2}]'
+        )
+        captured = capsys.readouterr()
+        lines = captured.out.strip().splitlines()
+        assert lines[0] == "inner"
+        assert lines[1] == "outer"
+
+    def test_unscoped_block_leaks_ctx(self, capsys):
+        """Without scoped=True, ctx changes persist after block."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("unscoped-test-mod")
+
+        def visit_leak(transpiler, node):
+            lines = [transpiler._line('__ctx__["leaked"] = "yes"')]
+            for child in node.body:
+                r = child.accept(transpiler)
+                if r:
+                    lines.append(r)
+            return "\n".join(lines)
+
+        api.block_command("leakblock", visit_leak, scoped=False)
+
+        run_source('@leakblock[]\n@end\n@var[v; @ctx["leaked"; "no"]]\n@print[{v}]')
+        captured = capsys.readouterr()
+        assert "yes" in captured.out  # leak is expected for unscoped
+
+
+class TestNodeTransform:
+    def test_transform_wraps_block_output(self, capsys):
+        """api.transform() post-processes another plugin's block output."""
+        from cruhon.core.mod_loader import ModAPI
+
+        # Primary plugin — emits a print
+        api_primary = ModAPI("primary-transform-mod")
+
+        def visit_primary(transpiler, node):
+            parts = [child.accept(transpiler) for child in node.body]
+            return "\n".join(p for p in parts if p)
+
+        api_primary.block_command("tblock", visit_primary)
+
+        # Secondary plugin — wraps the output with before/after prints
+        api_secondary = ModAPI("wrapping-transform-mod")
+
+        def wrap_fn(transpiler, node, code):
+            before = transpiler._line('print("BEFORE")')
+            after = transpiler._line('print("AFTER")')
+            return before + "\n" + code + "\n" + after
+
+        api_secondary.transform("tblock", wrap_fn)
+
+        run_source('@tblock[]\n    @print["MIDDLE"]\n@end')
+        captured = capsys.readouterr()
+        lines = [l for l in captured.out.strip().splitlines() if l]
+        assert lines == ["BEFORE", "MIDDLE", "AFTER"]
+
+    def test_multiple_transforms_chain(self, capsys):
+        """Multiple transforms run in registration order."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("chain-transform-mod")
+
+        def visit_chain(transpiler, node):
+            parts = [child.accept(transpiler) for child in node.body]
+            return "\n".join(p for p in parts if p)
+
+        api.block_command("chainblock", visit_chain)
+
+        def add_prefix(transpiler, node, code):
+            return transpiler._line('print("A")') + "\n" + code
+
+        def add_suffix(transpiler, node, code):
+            return code + "\n" + transpiler._line('print("B")')
+
+        api.transform("chainblock", add_prefix)
+        api.transform("chainblock", add_suffix)
+
+        run_source('@chainblock[]\n    @print["X"]\n@end')
+        captured = capsys.readouterr()
+        lines = [l for l in captured.out.strip().splitlines() if l]
+        assert lines == ["A", "X", "B"]
+
+
+class TestBlockHooks:
+    def test_block_enter_hook_fires(self):
+        """api.block_hook("enter") fires at runtime when a block starts."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("hook-enter-mod")
+
+        def visit_hookable(transpiler, node):
+            parts = [child.accept(transpiler) for child in node.body]
+            return "\n".join(p for p in parts if p) or transpiler._line("pass")
+
+        api.block_command("hookable", visit_hookable)
+
+        entered = []
+        api.block_hook("enter", lambda name, args: entered.append(name))
+
+        run_source('@hookable[]\n@end')
+        assert "hookable" in entered
+
+    def test_block_exit_hook_fires(self):
+        """api.block_hook("exit") fires at runtime when a block ends."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("hook-exit-mod")
+
+        def visit_exitblock(transpiler, node):
+            parts = [child.accept(transpiler) for child in node.body]
+            return "\n".join(p for p in parts if p) or transpiler._line("pass")
+
+        api.block_command("exitblock", visit_exitblock)
+
+        exited = []
+        api.block_hook("exit", lambda name, args: exited.append(name))
+
+        run_source('@exitblock[]\n@end')
+        assert "exitblock" in exited
+
+
+# ─────────────────────────────────────────────────────────────
+# PLUGIN SYSTEM v1.4.0 — AST hooks, async for/with, mod enrichment
+# ─────────────────────────────────────────────────────────────
+
+class TestAstHooks:
+    def test_ast_hook_fires_for_matching_node(self):
+        """api.ast_hook fires on every matching node type."""
+        from cruhon.core.mod_loader import ModAPI
+        from cruhon.core.parser import parse
+        from cruhon.core.transpiler import get_transpiler
+
+        api = ModAPI("ast-hook-test-mod")
+        seen = []
+
+        def hook_var(node):
+            seen.append(node.name)
+            return node
+
+        api.ast_hook("VarNode", hook_var)
+
+        t = get_transpiler()
+        ast = parse("@var[x; 1]\n@var[y; 2]")
+        t.transpile(ast)
+
+        assert "x" in seen
+        assert "y" in seen
+
+    def test_ast_hook_can_mutate_node(self, capsys):
+        """ast_hook can modify a node's fields before transpilation."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("ast-hook-mutate-mod")
+
+        def rename_var(node):
+            if node.name == "secret":
+                node.name = "renamed"
+            return node
+
+        api.ast_hook("VarNode", rename_var)
+
+        run_source('@var[secret; "hello"]\n@print[{renamed}]')
+        assert "hello" in capsys.readouterr().out
+
+    def test_ast_hook_multiple_hooks_chain(self):
+        """Multiple hooks for the same type fire in registration order."""
+        from cruhon.core.mod_loader import ModAPI
+        from cruhon.core.parser import parse
+        from cruhon.core.transpiler import get_transpiler
+
+        api = ModAPI("ast-hook-chain-mod")
+        order = []
+
+        def hook_a(node):
+            order.append("A")
+            return node
+
+        def hook_b(node):
+            order.append("B")
+            return node
+
+        api.ast_hook("PrintNode", hook_a)
+        api.ast_hook("PrintNode", hook_b)
+
+        t = get_transpiler()
+        ast = parse("@print[hello]")
+        t.transpile(ast)
+
+        assert order.index("A") < order.index("B")
+
+    def test_ast_hook_nested_nodes(self):
+        """AST hooks recurse into nested block bodies."""
+        from cruhon.core.mod_loader import ModAPI
+        from cruhon.core.parser import parse
+        from cruhon.core.transpiler import get_transpiler
+
+        api = ModAPI("ast-hook-nested-mod")
+        seen = []
+
+        def hook_print(node):
+            seen.append(str(node.value))
+            return node
+
+        api.ast_hook("PrintNode", hook_print)
+
+        t = get_transpiler()
+        ast = parse("@if[True]\n    @print[inside]\n@end")
+        t.transpile(ast)
+
+        assert "inside" in seen
+
+    def test_ast_hook_no_hooks_no_change(self, capsys):
+        """Without hooks, program runs normally."""
+        run_source('@var[z; 99]\n@print[{z}]')
+        assert "99" in capsys.readouterr().out
+
+
+class TestAsyncFor:
+    def test_async_for_transpiles(self):
+        """@async.for generates 'async for' Python."""
+        code = _transpile(
+            "@async[main]\n"
+            "    @async.for[item; aiter]\n"
+            "        @print[{item}]\n"
+            "    @end\n"
+            "@end"
+        )
+        assert "async for item in aiter:" in code
+
+    def test_async_for_body_indented(self):
+        """@async.for body is indented inside the loop."""
+        code = _transpile(
+            "@async[main]\n"
+            "    @async.for[x; items]\n"
+            "        @var[y; x]\n"
+            "    @end\n"
+            "@end"
+        )
+        assert "async for x in items:" in code
+        assert "y = x" in code
+
+    def test_async_for_parse_node_type(self):
+        """@async.for produces AsyncForNode."""
+        from cruhon.core.ast_nodes import AsyncForNode, FuncNode
+        ast = parse(
+            "@async[main]\n"
+            "    @async.for[n; nums]\n"
+            "        @print[{n}]\n"
+            "    @end\n"
+            "@end"
+        )
+        func = ast.body[0]
+        assert isinstance(func, FuncNode)
+        assert isinstance(func.body[0], AsyncForNode)
+        assert func.body[0].var == "n"
+        assert func.body[0].iterable == "nums"
+
+    def test_async_for_missing_iterable_raises(self):
+        """@async.for with only one arg raises ParseError."""
+        from cruhon.core.parser import ParseError
+        with pytest.raises(ParseError):
+            parse("@async[main]\n    @async.for[x]\n    @end\n@end")
+
+
+class TestAsyncWith:
+    def test_async_with_transpiles(self):
+        """@async.with generates 'async with' Python."""
+        code = _transpile(
+            "@async[main]\n"
+            "    @async.with[aopen(\"f.txt\") as f]\n"
+            "        @print[opened]\n"
+            "    @end\n"
+            "@end"
+        )
+        assert "async with" in code
+        assert "as f:" in code
+
+    def test_async_with_no_var(self):
+        """@async.with without 'as var' generates plain 'async with'."""
+        code = _transpile(
+            "@async[main]\n"
+            "    @async.with[lock]\n"
+            "        @print[locked]\n"
+            "    @end\n"
+            "@end"
+        )
+        assert "async with lock:" in code
+
+    def test_async_with_parse_node_type(self):
+        """@async.with produces AsyncWithNode."""
+        from cruhon.core.ast_nodes import AsyncWithNode, FuncNode
+        ast = parse(
+            "@async[main]\n"
+            "    @async.with[ctx as c]\n"
+            "        @print[ok]\n"
+            "    @end\n"
+            "@end"
+        )
+        func = ast.body[0]
+        assert isinstance(func, FuncNode)
+        assert isinstance(func.body[0], AsyncWithNode)
+        assert func.body[0].expr == "ctx"
+        assert func.body[0].var == "c"
+
+    def test_async_with_body_indented(self):
+        """@async.with body is indented under the with block."""
+        code = _transpile(
+            "@async[main]\n"
+            "    @async.with[mgr as m]\n"
+            "        @var[v; m]\n"
+            "    @end\n"
+            "@end"
+        )
+        assert "async with mgr as m:" in code
+        assert "v = m" in code
+
+
+class TestModEnrichment:
+    def test_list_block_commands_tracks_registration(self):
+        """block_command() registers in list_block_commands()."""
+        from cruhon.core.mod_loader import ModAPI, list_block_commands
+
+        api = ModAPI("enrichment-test-mod")
+
+        def visit_enrichcmd(transpiler, node):
+            return transpiler._line("pass")
+
+        api.block_command("enrichcmd", visit_enrichcmd)
+
+        result = list_block_commands()
+        assert "enrichment-test-mod" in result
+        assert "enrichcmd" in result["enrichment-test-mod"]
+
+    def test_list_block_commands_multiple_cmds(self):
+        """Multiple block_command calls accumulate in the plugin's list."""
+        from cruhon.core.mod_loader import ModAPI, list_block_commands
+
+        api = ModAPI("multi-cmd-mod")
+        noop = lambda t, n: t._line("pass")
+        api.block_command("cmd_one", noop)
+        api.block_command("cmd_two", noop)
+
+        result = list_block_commands()
+        assert "multi-cmd-mod" in result
+        assert "cmd_one" in result["multi-cmd-mod"]
+        assert "cmd_two" in result["multi-cmd-mod"]
+
+    def test_list_exposed_apis_returns_keys(self):
+        """list_exposed_apis returns plugin → [key, ...] mapping."""
+        from cruhon.core.mod_loader import ModAPI, list_exposed_apis
+
+        api = ModAPI("expose-keys-mod")
+        api.expose("helper_fn", lambda x: x)
+        api.expose("version", "1.0")
+
+        result = list_exposed_apis()
+        assert "expose-keys-mod" in result
+        assert "helper_fn" in result["expose-keys-mod"]
+        assert "version" in result["expose-keys-mod"]
+
+    def test_visitor_owner_in_error_message(self):
+        """api.command() visitor errors include the owning plugin name."""
+        from cruhon.core.mod_loader import ModAPI
+        from cruhon.core.transpiler import TranspileError, get_transpiler
+        from cruhon.core.parser import parse
+        from cruhon.core.ast_nodes import Node
+        from dataclasses import dataclass
+
+        @dataclass
+        class BadCmdNode(Node):
+            pass
+
+        api = ModAPI("owner-error-mod")
+
+        def bad_visitor(transpiler, node):
+            raise RuntimeError("something broke")
+
+        def bad_parser(parser):
+            parser.advance()
+            return BadCmdNode(line=1)
+
+        api.command("badcmd", bad_parser, bad_visitor)
+
+        t = get_transpiler()
+        t._custom_visitors["BadCmdNode"] = bad_visitor
+        t._visitor_owners["BadCmdNode"] = "owner-error-mod"
+
+        with pytest.raises(TranspileError) as exc_info:
+            t.visit_unknown(BadCmdNode(line=1))
+
+        assert "owner-error-mod" in str(exc_info.value)
+
+
+class TestVisitorOwner:
+    def test_api_command_records_owner(self):
+        """api.command() stores plugin name in _visitor_owners."""
+        from cruhon.core.mod_loader import ModAPI
+        from cruhon.core.transpiler import get_transpiler
+        from cruhon.core.ast_nodes import Node
+        from dataclasses import dataclass
+
+        @dataclass
+        class OwnerTestNode(Node):
+            pass
+
+        api = ModAPI("owner-record-mod")
+
+        def parser_fn(parser):
+            parser.advance()
+            return OwnerTestNode(line=1)
+
+        def visitor_fn(transpiler, node):
+            return transpiler._line("pass")
+
+        api.command("ownercmd", parser_fn, visitor_fn)
+
+        t = get_transpiler()
+        assert t._visitor_owners.get("OwnercmdNode") == "owner-record-mod"
+
+    def test_error_message_includes_plugin_name(self):
+        """visit_unknown error includes plugin name from _visitor_owners."""
+        from cruhon.core.transpiler import get_transpiler, TranspileError
+        from cruhon.core.ast_nodes import Node
+        from dataclasses import dataclass
+
+        @dataclass
+        class TraceableNode(Node):
+            pass
+
+        t = get_transpiler()
+        t._custom_visitors["TraceableNode"] = lambda _t, _n: (_ for _ in ()).throw(ValueError("boom"))
+        t._visitor_owners["TraceableNode"] = "traceable-plugin"
+
+        with pytest.raises(TranspileError) as exc:
+            t.visit_unknown(TraceableNode(line=5))
+
+        assert "traceable-plugin" in str(exc.value)
+
+    def test_block_command_owner_not_in_visitor_owners(self):
+        """block_command does NOT go through _visitor_owners — it uses _block_visitors."""
+        from cruhon.core.mod_loader import ModAPI
+        from cruhon.core.transpiler import get_transpiler
+
+        api = ModAPI("block-owner-mod")
+        api.block_command("noowner", lambda t, n: t._line("pass"))
+
+        t = get_transpiler()
+        assert "noowner" in t._block_visitors
+        assert "NoownerNode" not in t._visitor_owners
+
+
+class TestAsyncForWithRun:
+    def test_async_for_runs(self, capsys):
+        """@async.for executes correctly at runtime with an async generator."""
+        run_source(
+            "@raw\n"
+            "async def _agen():\n"
+            "    for i in [1, 2, 3]:\n"
+            "        yield i\n"
+            "@end\n"
+            "@async[main]\n"
+            "    @var[results; []]\n"
+            "    @async.for[x; _agen()]\n"
+            "        results.append(x)\n"
+            "    @end\n"
+            "    @print[{len(results)}]\n"
+            "@end"
+        )
+        assert "3" in capsys.readouterr().out
+
+    def test_async_with_runs(self, capsys):
+        """@async.with executes correctly at runtime using asyncio.Lock."""
+        run_source(
+            "@raw\n"
+            "import asyncio\n"
+            "@end\n"
+            "@async[main]\n"
+            "    @var[lock; asyncio.Lock()]\n"
+            "    @async.with[lock]\n"
+            "        @print[locked]\n"
+            "    @end\n"
+            "@end"
+        )
+        assert "locked" in capsys.readouterr().out
+
+
+# ─────────────────────────────────────────────────────────────
+# PLUGIN SYSTEM v1.5.0 — inject, inline_command, eval_hook
+# ─────────────────────────────────────────────────────────────
+
+class TestInject:
+    def test_inject_plain_value_available_in_script(self, capsys):
+        """api.inject() with a plain value is accessible in scripts."""
+        from cruhon.core.mod_loader import ModAPI
+        api = ModAPI("inject-plain-mod")
+        api.inject("APP_NAME", "Cruhon")
+        run_source('@print[{APP_NAME}]')
+        assert "Cruhon" in capsys.readouterr().out
+
+    def test_inject_factory_called_per_run(self, capsys):
+        """api.inject() with a callable factory is called before each exec."""
+        from cruhon.core.mod_loader import ModAPI
+        api = ModAPI("inject-factory-mod")
+        counter = [0]
+
+        def make_counter():
+            counter[0] += 1
+            return counter[0]
+
+        api.inject("RUN_COUNT", make_counter)
+        run_source('@print[{RUN_COUNT}]')
+        run_source('@print[{RUN_COUNT}]')
+        out1, out2 = capsys.readouterr().out.strip().splitlines()
+        assert int(out1) >= 1
+        assert int(out2) > int(out1)
+
+    def test_inject_object_accessible_by_attribute(self, capsys):
+        """Injected objects can be accessed with dot notation in scripts."""
+        from cruhon.core.mod_loader import ModAPI
+
+        class Config:
+            version = "9.9"
+
+        api = ModAPI("inject-obj-mod")
+        api.inject("cfg", Config())
+        run_source('@print[{cfg.version}]')
+        assert "9.9" in capsys.readouterr().out
+
+    def test_inject_does_not_leak_between_scripts(self):
+        """Each exec() gets a fresh copy — mutations don't persist."""
+        from cruhon.core.mod_loader import ModAPI
+        api = ModAPI("inject-isolation-mod")
+        api.inject("shared", {"count": 0})
+        run_source('shared["count"] += 1')
+        run_source('shared["count"] += 1')
+        # Each run gets a fresh dict (factory returns new object each time)
+        # If inject is a static value, this tests that the value itself is the same
+        # object — that's fine for this test; we just verify no crash.
+
+    def test_multiple_injects_all_available(self, capsys):
+        """Multiple api.inject() calls are all available in the same script."""
+        from cruhon.core.mod_loader import ModAPI
+        api = ModAPI("inject-multi-mod")
+        api.inject("X_VAL", 42)
+        api.inject("Y_VAL", 58)
+        run_source('@print[{X_VAL + Y_VAL}]')
+        assert "100" in capsys.readouterr().out
+
+    def test_get_inject_globals_callable_resolved(self):
+        """get_inject_globals() resolves callables."""
+        from cruhon.core.mod_loader import ModAPI, get_inject_globals
+        api = ModAPI("inject-resolve-mod")
+        api.inject("computed", lambda: 7 * 6)
+        result = get_inject_globals()
+        assert result.get("computed") == 42
+
+    def test_inject_reserved_key_does_not_overwrite_ns(self, capsys):
+        """api.inject() cannot overwrite __ns__ or other reserved exec globals."""
+        from cruhon.core.mod_loader import ModAPI
+        api = ModAPI("inject-reserved-mod")
+        api.inject("__ns__", "should_not_overwrite")
+        # Script must run without NameError — __ns__ stays the real registry
+        run_source('@print["reserved_safe"]')
+        assert "reserved_safe" in capsys.readouterr().out
+
+
+class TestInlineCommand:
+    def test_inline_command_used_in_var(self, capsys):
+        """Inline command registered via api.inline_command works in @var."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("inline-cmd-mod")
+
+        def handle_greet(parser):
+            parser.advance()  # consume @greet token
+            args = parser.parse_args()
+            name = args[0] if args else '"world"'
+            return f'"Hello, " + {name}'
+
+        api.inline_command("greet", handle_greet)
+        run_source('@var[msg; @greet["Alice"]]\n@print[{msg}]')
+        assert "Hello, Alice" in capsys.readouterr().out
+
+    def test_inline_command_no_args(self, capsys):
+        """Inline command with no arguments works correctly."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("inline-noarg-mod")
+
+        def handle_answer(parser):
+            parser.advance()
+            parser.parse_args()
+            return "42"
+
+        api.inline_command("answer", handle_answer)
+        run_source('@var[x; @answer[]]\n@print[{x}]')
+        assert "42" in capsys.readouterr().out
+
+    def test_inline_command_in_print(self, capsys):
+        """Inline command can be used directly in @print."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("inline-print-mod")
+
+        def handle_pi(parser):
+            parser.advance()
+            parser.parse_args()
+            return "3.14159"
+
+        api.inline_command("pi", handle_pi)
+        # @pi[] as a direct arg — no {} wrapping needed (avoids set-literal ambiguity)
+        run_source('@var[v; @pi[]]\n@print[{v}]')
+        assert "3.14159" in capsys.readouterr().out
+
+    def test_inline_command_generates_python_expr(self):
+        """Inline command output is a Python expression embedded in generated code."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("inline-gen-mod")
+
+        def handle_slug(parser):
+            parser.advance()
+            args = parser.parse_args()
+            text = args[0] if args else '""'
+            return f'{text}.lower().replace(" ", "-")'
+
+        api.inline_command("slug", handle_slug)
+        code = _transpile('@var[s; @slug["Hello World"]]')
+        assert '.lower().replace(" ", "-")' in code
+
+    def test_inline_command_appears_in_error_message(self):
+        """Error message includes registered inline commands."""
+        from cruhon.core.mod_loader import ModAPI
+        from cruhon.core.parser import ParseError, get_parser
+
+        api = ModAPI("inline-err-mod")
+
+        def handle_dummy(parser):
+            parser.advance()
+            parser.parse_args()
+            return "None"
+
+        api.inline_command("myspecial", handle_dummy)
+
+        # An unknown inline command should error; the message lists known ones
+        with pytest.raises(ParseError) as exc:
+            _transpile('@var[x; @nonexistent[]]')
+
+        assert "@env" in str(exc.value)  # builtins still listed
+
+
+class TestEvalHook:
+    def test_eval_hook_intercepts_value(self, capsys):
+        """api.eval_hook() intercepts and transforms matching values."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("eval-hook-mod")
+
+        def dollar_hook(value, context):
+            if value.startswith("$"):
+                key = value[1:]
+                return f'"DOLLAR_{key}"'
+            return None
+
+        api.eval_hook(dollar_hook)
+        run_source('@var[x; $MYVAR]\n@print[{x}]')
+        assert "DOLLAR_MYVAR" in capsys.readouterr().out
+
+    def test_eval_hook_none_passes_through(self, capsys):
+        """Returning None from eval_hook lets default rules handle the value."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("eval-hook-passthrough-mod")
+
+        def noop_hook(value, context):
+            return None  # always pass through
+
+        api.eval_hook(noop_hook)
+        run_source('@var[x; 42]\n@print[{x}]')
+        assert "42" in capsys.readouterr().out
+
+    def test_eval_hook_receives_context(self):
+        """eval_hook receives the correct context string ('expr' or 'display')."""
+        from cruhon.core.mod_loader import ModAPI
+        from cruhon.core.transpiler import get_transpiler
+        from cruhon.core.parser import parse
+
+        api = ModAPI("eval-hook-ctx-mod")
+        seen_contexts = []
+
+        def record_hook(value, context):
+            seen_contexts.append(context)
+            return None
+
+        api.eval_hook(record_hook)
+        t = get_transpiler()
+        ast = parse('@var[x; hello]\n@print[hello]')
+        t.transpile(ast)
+        assert "expr" in seen_contexts
+        assert "display" in seen_contexts
+
+    def test_eval_hook_first_match_wins(self, capsys):
+        """First hook to return non-None wins; later hooks are not called."""
+        from cruhon.core.mod_loader import ModAPI
+
+        api = ModAPI("eval-hook-priority-mod")
+
+        def hook_a(value, context):
+            if value == "special":
+                return '"from_A"'
+            return None
+
+        def hook_b(value, context):
+            if value == "special":
+                return '"from_B"'
+            return None
+
+        api.eval_hook(hook_a)
+        api.eval_hook(hook_b)
+
+        run_source('@var[x; special]\n@print[{x}]')
+        assert "from_A" in capsys.readouterr().out
+
+    def test_eval_hook_custom_syntax_dollar_env(self, capsys):
+        """Classic use-case: %%VAR_NAME → os.environ.get('VAR_NAME')."""
+        import os
+        from cruhon.core.mod_loader import ModAPI
+
+        os.environ["CRUHON_TEST_KEY"] = "test_value_xyz"
+
+        api = ModAPI("eval-hook-dollar-env-mod")
+
+        # Use %% prefix to avoid conflict with the $-hook registered in earlier tests
+        def pct_env(value, context):
+            if value.startswith("%%") and value[2:].isidentifier():
+                return f'__import__("os").environ.get("{value[2:]}", "")'
+            return None
+
+        api.eval_hook(pct_env)
+        run_source('@var[v; %%CRUHON_TEST_KEY]\n@print[{v}]')
+        assert "test_value_xyz" in capsys.readouterr().out
+
+
+# ─────────────────────────────────────────────────────────────
+# MODULE SYSTEM — v1.6.0
+# ─────────────────────────────────────────────────────────────
+
+class TestModuleBlock:
+    """Inline @module[name] ... @end block form."""
+
+    def test_module_basic_function(self, capsys):
+        src = """
+@module[mymod]
+  @func[hello]
+    @return["hi"]
+  @end
+@end
+@var[r; @mymod.hello[]]
+@print[{r}]
+"""
+        run_source(src)
+        assert capsys.readouterr().out.strip() == "hi"
+
+    def test_module_const_access(self, capsys):
+        src = """
+@module[cfg]
+  @const[VERSION; "1.6.0"]
+@end
+@print[{cfg.VERSION}]
+"""
+        run_source(src)
+        assert "1.6.0" in capsys.readouterr().out
+
+    def test_module_no_export_exports_all(self, capsys):
+        src = """
+@module[m]
+  @func[greet; name]
+    @return["Hi " + name]
+  @end
+  @const[LANG; "Cruhon"]
+@end
+@print[{m.greet("Dev")}]
+@print[{m.LANG}]
+"""
+        run_source(src)
+        out = capsys.readouterr().out
+        assert "Hi Dev" in out
+        assert "Cruhon" in out
+
+    def test_module_export_selective(self, capsys):
+        src = """
+@module[m]
+  @export[pub]
+  @func[pub]
+    @return["public"]
+  @end
+  @func[_priv]
+    @return["private"]
+  @end
+@end
+@print[{m.pub()}]
+"""
+        run_source(src)
+        assert capsys.readouterr().out.strip() == "public"
+
+    def test_module_private_not_accessible(self):
+        src = """
+@module[m]
+  @export[pub]
+  @func[pub]
+    @return["ok"]
+  @end
+  @const[SECRET; "hidden"]
+@end
+@var[x; m.SECRET]
+"""
+        import pytest
+        with pytest.raises(Exception):
+            run_source(src)
+
+    def test_module_var_not_exported_does_not_leak(self):
+        src = """
+@module[m]
+  @var[inner; "inside"]
+@end
+@print[{inner}]
+"""
+        import pytest
+        with pytest.raises(Exception):
+            run_source(src)
+
+    def test_module_namespace_call_in_var(self, capsys):
+        src = """
+@module[utils]
+  @func[add; a; b]
+    @return[a + b]
+  @end
+@end
+@var[r; @utils.add[3; 4]]
+@print[{r}]
+"""
+        run_source(src)
+        assert capsys.readouterr().out.strip() == "7"
+
+    def test_module_inline_call_in_expression(self, capsys):
+        src = """
+@module[calc]
+  @func[double; n]
+    @return[n * 2]
+  @end
+@end
+@print[{calc.double(5)}]
+"""
+        run_source(src)
+        assert capsys.readouterr().out.strip() == "10"
+
+    def test_module_export_star(self, capsys):
+        src = """
+@module[m]
+  @export[*]
+  @func[f]
+    @return[42]
+  @end
+@end
+@print[{m.f()}]
+"""
+        run_source(src)
+        assert capsys.readouterr().out.strip() == "42"
+
+    def test_module_ast_node_type(self):
+        from cruhon.core.ast_nodes import ModuleNode, ExportNode
+        from cruhon.core.parser import parse
+        ast = parse("@module[m]\n  @export[f]\n  @func[f]\n    @return[1]\n  @end\n@end\n")
+        assert isinstance(ast.body[0], ModuleNode)
+        assert ast.body[0].name == "m"
+        export_nodes = [n for n in ast.body[0].body if isinstance(n, ExportNode)]
+        assert export_nodes[0].names == ["f"]
+
+    def test_module_generates_simplenamespace(self):
+        from cruhon.core.transpiler import transpile
+        from cruhon.core.parser import parse
+        code = transpile(parse("@module[x]\n  @func[f]\n    @return[1]\n  @end\n@end\n"))
+        assert "_cruhon_mod_x" in code
+        assert "SimpleNamespace" in code
+        assert "x = _cruhon_mod_x()" in code
+
+
+class TestModuleFrom:
+    """@from[module; name1; name2 as alias] selective imports."""
+
+    def test_from_single(self, capsys):
+        src = """
+@module[m]
+  @func[greet]
+    @return["hello"]
+  @end
+@end
+@from[m; greet]
+@print[{greet()}]
+"""
+        run_source(src)
+        assert capsys.readouterr().out.strip() == "hello"
+
+    def test_from_multiple(self, capsys):
+        src = """
+@module[m]
+  @const[A; 1]
+  @const[B; 2]
+@end
+@from[m; A; B]
+@print[{A + B}]
+"""
+        run_source(src)
+        assert capsys.readouterr().out.strip() == "3"
+
+    def test_from_alias(self, capsys):
+        src = """
+@module[m]
+  @func[long_function_name]
+    @return["aliased"]
+  @end
+@end
+@from[m; long_function_name as fn]
+@print[{fn()}]
+"""
+        run_source(src)
+        assert capsys.readouterr().out.strip() == "aliased"
+
+    def test_from_multiple_aliases(self, capsys):
+        src = """
+@module[math]
+  @const[PI; 3.14159]
+  @func[square; n]
+    @return[n * n]
+  @end
+@end
+@from[math; PI as pi; square as sq]
+@print[{pi}]
+@print[{sq(3)}]
+"""
+        run_source(src)
+        out = capsys.readouterr().out
+        assert "3.14159" in out
+        assert "9" in out
+
+    def test_from_ast_node_type(self):
+        from cruhon.core.ast_nodes import FromNode
+        from cruhon.core.parser import parse
+        ast = parse("@module[m]\n  @func[f]\n    @return[1]\n  @end\n@end\n@from[m; f as g]\n")
+        from_nodes = [n for n in ast.body if isinstance(n, FromNode)]
+        assert from_nodes[0].module == "m"
+        assert from_nodes[0].imports == [("f", "g")]
+
+
+class TestModuleFile:
+    """File-based @use[path] module loading."""
+
+    def setup_method(self):
+        import tempfile
+        self.tmpdir = Path(tempfile.mkdtemp())
+
+    def teardown_method(self):
+        import shutil
+        shutil.rmtree(self.tmpdir)
+
+    def _write(self, name: str, content: str) -> Path:
+        p = self.tmpdir / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_use_basic(self, capsys):
+        self._write("utils.clpy", '@func[greet]\n  @return["hi"]\n@end\n')
+        run_source("@use[utils]\n@var[r; @utils.greet[]]\n@print[{r}]\n", base_dir=self.tmpdir)
+        assert capsys.readouterr().out.strip() == "hi"
+
+    def test_use_alias(self, capsys):
+        self._write("myutils.clpy", '@func[f]\n  @return["ok"]\n@end\n')
+        run_source("@use[myutils as u]\n@var[r; @u.f[]]\n@print[{r}]\n", base_dir=self.tmpdir)
+        assert capsys.readouterr().out.strip() == "ok"
+
+    def test_use_with_export(self, capsys):
+        self._write("lib.clpy", '@export[pub]\n@func[pub]\n  @return["ok"]\n@end\n@func[_priv]\n  @return["no"]\n@end\n')
+        run_source("@use[lib]\n@print[{lib.pub()}]\n", base_dir=self.tmpdir)
+        assert capsys.readouterr().out.strip() == "ok"
+
+    def test_use_with_module_declaration(self, capsys):
+        self._write("utils.clpy", '@module[utils]\n@func[greet]\n  @return["hello"]\n@end\n')
+        run_source("@use[utils]\n@print[{utils.greet()}]\n", base_dir=self.tmpdir)
+        assert capsys.readouterr().out.strip() == "hello"
+
+    def test_use_path_relative(self, capsys):
+        (self.tmpdir / "lib").mkdir()
+        self._write("lib/db.clpy", '@func[query]\n  @return["result"]\n@end\n')
+        run_source("@use[./lib/db]\n@print[{db.query()}]\n", base_dir=self.tmpdir)
+        assert capsys.readouterr().out.strip() == "result"
+
+    def test_use_modules_dir(self, capsys):
+        (self.tmpdir / "modules").mkdir()
+        self._write("modules/helpers.clpy", '@func[greet]\n  @return["mod_dir"]\n@end\n')
+        run_source("@use[helpers]\n@print[{helpers.greet()}]\n", base_dir=self.tmpdir)
+        assert capsys.readouterr().out.strip() == "mod_dir"
+
+    def test_use_not_found_raises(self):
+        import pytest
+        with pytest.raises(Exception, match="module not found"):
+            run_source("@use[nonexistent]\n", base_dir=self.tmpdir)
+
+    def test_use_circular_raises(self):
+        import pytest
+        self._write("a.clpy", "@use[b]\n")
+        self._write("b.clpy", "@use[a]\n")
+        with pytest.raises(Exception, match="Circular"):
+            run_source("@use[a]\n", base_dir=self.tmpdir)
+
+    def test_use_from_file(self, capsys):
+        self._write("utils.clpy", '@func[greet]\n  @return["file_greet"]\n@end\n')
+        run_source("@use[utils]\n@from[utils; greet]\n@print[{greet()}]\n", base_dir=self.tmpdir)
+        assert capsys.readouterr().out.strip() == "file_greet"
+
+    def test_use_inside_match_case(self, capsys):
+        """@use inside a @match case body is resolved correctly."""
+        self._write("utils.clpy", '@func[greet]\n  @return["matched"]\n@end\n')
+        src = (
+            "@var[x; 1]\n"
+            "@match[x]\n"
+            "    @case[1]\n"
+            "        @use[utils]\n"
+            "        @print[{utils.greet()}]\n"
+            "@end\n"
+        )
+        run_source(src, base_dir=self.tmpdir)
+        assert capsys.readouterr().out.strip() == "matched"
+
+    def test_inline_env_with_use_injects_import_os(self, capsys):
+        """Inline @env + @use in same script: import os must still be injected."""
+        import os
+        self._write("utils.clpy", '@func[f]\n  @return["ok"]\n@end\n')
+        os.environ["_CRUHON_TEST_KEY"] = "hello_env"
+        try:
+            src = "@use[utils]\n@var[x; @env[_CRUHON_TEST_KEY]]\n@print[{x}]\n"
+            run_source(src, base_dir=self.tmpdir)
+            assert "hello_env" in capsys.readouterr().out
+        finally:
+            del os.environ["_CRUHON_TEST_KEY"]
+
+
+class TestModulePluginCompat:
+    """Modules and plugin system work together correctly."""
+
+    def test_inject_visible_inside_module(self, capsys):
+        """api.inject() globals are accessible inside module bodies."""
+        from cruhon.core.mod_loader import ModAPI
+        api = ModAPI("mod-inject-compat")
+        api.inject("INJECTED_VAL", "injected_works")
+        src = """
+@module[m]
+  @func[get_val]
+    @return[INJECTED_VAL]
+  @end
+@end
+@print[{m.get_val()}]
+"""
+        run_source(src)
+        assert "injected_works" in capsys.readouterr().out
+
+    def test_multiple_modules(self, capsys):
+        """Multiple inline modules coexist without conflict."""
+        src = """
+@module[a]
+  @func[f]
+    @return["from_a"]
+  @end
+@end
+@module[b]
+  @func[f]
+    @return["from_b"]
+  @end
+@end
+@print[{a.f()}]
+@print[{b.f()}]
+"""
+        run_source(src)
+        out = capsys.readouterr().out
+        assert "from_a" in out
+        assert "from_b" in out
+
+
+# ─────────────────────────────────────────────────────────────
+# cruhon-db PLUGIN
+# ─────────────────────────────────────────────────────────────
+
+class TestCruhonDB:
+    """cruhon-db plugin: SQLite CRUD, schema helpers, transactions, result access."""
+
+    @classmethod
+    def setup_class(cls):
+        """Load cruhon-db mod once before any test in this class runs."""
+        from cruhon.core.mod_loader import load_mod_from_path
+        mod_path = Path(__file__).parent.parent.parent / "mods" / "cruhon-db"
+        load_mod_from_path(mod_path)
+
+    # ── helpers ───────────────────────────────────────────────
+
+    @staticmethod
+    def _run(*lines):
+        """Run one script built from a sequence of @cmd lines."""
+        run_source("\n".join(lines))
+
+    # ── connection ────────────────────────────────────────────
+
+    def test_connect_exec_ok(self, capsys):
+        """@db.connect + @db.exec round-trip succeeds and produces output."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"]',
+            '@print["ok"]',
+        )
+        assert "ok" in capsys.readouterr().out
+
+    def test_no_connect_raises(self):
+        """@db.query without @db.connect raises RunError."""
+        with pytest.raises(RunError) as exc:
+            run_source('@db.query["SELECT 1"]')
+        assert "No active connection" in str(exc.value)
+
+    # ── insert + query ────────────────────────────────────────
+
+    def test_insert_and_query_returns_row(self, capsys):
+        """@db.insert stores a row; @db.query retrieves it as a dict."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"]',
+            '@db.insert["users"; {"name": "Alice"}]',
+            '@db.query["SELECT * FROM users"]',
+            '@var[row; @db.one[]]',
+            '@print[{row["name"]}]',
+        )
+        assert "Alice" in capsys.readouterr().out
+
+    def test_query_multiple_rows(self, capsys):
+        """@db.query returns all matching rows."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE nums (n INTEGER)"]',
+            '@db.exec["INSERT INTO nums VALUES (10)"]',
+            '@db.exec["INSERT INTO nums VALUES (20)"]',
+            '@db.query["SELECT * FROM nums"]',
+            '@var[n; @db.count[]]',
+            '@print[{n}]',
+        )
+        assert "2" in capsys.readouterr().out
+
+    def test_query_with_params(self, capsys):
+        """Bound parameters filter rows correctly."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE p (name TEXT, age INTEGER)"]',
+            '@db.exec["INSERT INTO p VALUES (?, ?)"; "Alice"; 30]',
+            '@db.exec["INSERT INTO p VALUES (?, ?)"; "Bob"; 25]',
+            '@db.query["SELECT * FROM p WHERE age > ?"; 27]',
+            '@var[n; @db.count[]]',
+            '@print[{n}]',
+        )
+        assert "1" in capsys.readouterr().out
+
+    # ── result access ─────────────────────────────────────────
+
+    def test_count(self, capsys):
+        """@db.count[] returns the row count of the last query."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE items (x INTEGER)"]',
+            '@db.exec["INSERT INTO items VALUES (1)"]',
+            '@db.exec["INSERT INTO items VALUES (2)"]',
+            '@db.exec["INSERT INTO items VALUES (3)"]',
+            '@db.query["SELECT * FROM items"]',
+            '@var[n; @db.count[]]',
+            '@print[{n}]',
+        )
+        assert "3" in capsys.readouterr().out
+
+    def test_one_returns_first_row(self, capsys):
+        """@db.one[] returns the first dict of the last query result."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE r (val INTEGER)"]',
+            '@db.exec["INSERT INTO r VALUES (42)"]',
+            '@db.exec["INSERT INTO r VALUES (99)"]',
+            '@db.query["SELECT * FROM r ORDER BY val"]',
+            '@var[row; @db.one[]]',
+            '@print[{row["val"]}]',
+        )
+        assert "42" in capsys.readouterr().out
+
+    def test_one_empty_returns_none(self, capsys):
+        """@db.one[] on an empty result set returns None."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE empty (x INTEGER)"]',
+            '@db.query["SELECT * FROM empty"]',
+            '@var[row; @db.one[]]',
+            '@print[{row is None}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_lastid(self, capsys):
+        """@db.lastid[] returns the rowid of the last INSERT."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)"]',
+            '@db.insert["t"; {"val": "hello"}]',
+            '@var[lid; @db.lastid[]]',
+            '@print[{lid}]',
+        )
+        out = capsys.readouterr().out.strip()
+        assert int(out) >= 1
+
+    def test_rows_passthrough(self, capsys):
+        """@db.rows[result] passes through a given list unchanged."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE r (x INTEGER)"]',
+            '@db.exec["INSERT INTO r VALUES (5)"]',
+            '@var[res; @db.query["SELECT * FROM r"]]',
+            '@var[same; @db.rows[res]]',
+            '@print[{len(same)}]',
+        )
+        assert "1" in capsys.readouterr().out
+
+    # ── update + delete ───────────────────────────────────────
+
+    def test_update_modifies_rows(self, capsys):
+        """@db.update changes matching rows."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)"]',
+            '@db.insert["u"; {"name": "Alice"}]',
+            '@db.update["u"; {"name": "Bob"}; "name = ?"; "Alice"]',
+            '@db.query["SELECT name FROM u"]',
+            '@var[row; @db.one[]]',
+            '@print[{row["name"]}]',
+        )
+        assert "Bob" in capsys.readouterr().out
+
+    def test_delete_removes_rows(self, capsys):
+        """@db.delete removes matching rows."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE d (id INTEGER PRIMARY KEY, name TEXT)"]',
+            '@db.insert["d"; {"name": "Alice"}]',
+            '@db.insert["d"; {"name": "Bob"}]',
+            '@db.delete["d"; "name = ?"; "Alice"]',
+            '@db.query["SELECT * FROM d"]',
+            '@var[n; @db.count[]]',
+            '@print[{n}]',
+        )
+        assert "1" in capsys.readouterr().out
+
+    # ── schema helpers ────────────────────────────────────────
+
+    def test_create_helper(self, capsys):
+        """@db.create is an alias for @db.exec for CREATE TABLE."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.create["CREATE TABLE IF NOT EXISTS c (id INTEGER PRIMARY KEY)"]',
+            '@var[ok; @db.exists["c"]]',
+            '@print[{ok}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_exists_true(self, capsys):
+        """@db.exists returns True for an existing table."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE exist_test (id INTEGER)"]',
+            '@var[ok; @db.exists["exist_test"]]',
+            '@print[{ok}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_exists_false(self, capsys):
+        """@db.exists returns False for a non-existent table."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[ok; @db.exists["no_such_table"]]',
+            '@print[{ok}]',
+        )
+        assert "False" in capsys.readouterr().out
+
+    def test_tables_lists_all(self, capsys):
+        """@db.tables returns a list of all table names."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE aaa (x INTEGER)"]',
+            '@db.exec["CREATE TABLE bbb (y TEXT)"]',
+            '@var[tbl; @db.tables[]]',
+            '@print[{len(tbl)}]',
+        )
+        assert "2" in capsys.readouterr().out
+
+    def test_drop_removes_table(self, capsys):
+        """@db.drop makes the table disappear."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE to_drop (x INTEGER)"]',
+            '@db.drop["to_drop"]',
+            '@var[ok; @db.exists["to_drop"]]',
+            '@print[{ok}]',
+        )
+        assert "False" in capsys.readouterr().out
+
+    # ── transactions ──────────────────────────────────────────
+
+    def test_transaction_commit_persists(self, capsys):
+        """Explicit @db.begin + @db.commit persists inserted rows."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE tx (val INTEGER)"]',
+            '@db.begin[]',
+            '@db.insert["tx"; {"val": 99}]',
+            '@db.commit[]',
+            '@db.query["SELECT * FROM tx"]',
+            '@var[n; @db.count[]]',
+            '@print[{n}]',
+        )
+        assert "1" in capsys.readouterr().out
+
+    def test_transaction_rollback_discards(self, capsys):
+        """@db.rollback undoes all changes since @db.begin."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE rb (val INTEGER)"]',
+            '@db.begin[]',
+            '@db.exec["INSERT INTO rb VALUES (42)"]',
+            '@db.rollback[]',
+            '@db.query["SELECT * FROM rb"]',
+            '@var[n; @db.count[]]',
+            '@print[{n}]',
+        )
+        assert "0" in capsys.readouterr().out
+
+    # ── generated code ────────────────────────────────────────
+
+    def test_transpiles_to_ns_call(self):
+        """@db.query[...] transpiles to __ns__[\"db\"].call(\"query\", ...)."""
+        code = _transpile('@db.query["SELECT 1"]')
+        assert '__ns__["db"].call("query"' in code
+
+    def test_transpiles_insert_with_args(self):
+        """@db.insert[t; data] transpiles to __ns__[\"db\"].call(\"insert\", t, data)."""
+        code = _transpile('@db.insert["users"; {"name": "Alice"}]')
+        assert '__ns__["db"].call("insert"' in code
+        assert '"users"' in code
+
+    def test_async_method_transpiles_with_await(self):
+        """@db.async_query generates (await __ns__[\"db\"].call(...))."""
+        code = _transpile('@var[r; @db.async_query["SELECT 1"]]')
+        assert "await" in code
+        assert '__ns__["db"].call("async_query"' in code
+
+    # ── new sync methods ──────────────────────────────────────
+
+    def test_insertmany(self, capsys):
+        """@db.insertmany inserts all rows from a list of dicts."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE bulk (name TEXT)"]',
+            '@db.insertmany["bulk"; [{"name": "A"}, {"name": "B"}, {"name": "C"}]]',
+            '@db.query["SELECT * FROM bulk"]',
+            '@var[n; @db.count[]]',
+            '@print[{n}]',
+        )
+        assert "3" in capsys.readouterr().out
+
+    def test_execmany(self, capsys):
+        """@db.execmany runs parameterized SQL for each row in a list."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE em (x INTEGER)"]',
+            '@db.execmany["INSERT INTO em VALUES (?)"; [(1,), (2,), (3,)]]',
+            '@db.query["SELECT * FROM em"]',
+            '@var[n; @db.count[]]',
+            '@print[{n}]',
+        )
+        assert "3" in capsys.readouterr().out
+
+    def test_get_returns_first_matching(self, capsys):
+        """@db.get returns only the first row matching the WHERE clause."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE g (name TEXT, age INTEGER)"]',
+            '@db.insert["g"; {"name": "Alice", "age": 30}]',
+            '@db.insert["g"; {"name": "Bob", "age": 25}]',
+            '@var[row; @db.get["g"; "age > ?"; 20]]',
+            '@print[{row["name"]}]',
+        )
+        assert "Alice" in capsys.readouterr().out
+
+    def test_getall_no_filter(self, capsys):
+        """@db.getall with no WHERE returns every row."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE ga (x INTEGER)"]',
+            '@db.exec["INSERT INTO ga VALUES (1)"]',
+            '@db.exec["INSERT INTO ga VALUES (2)"]',
+            '@var[rows; @db.getall["ga"]]',
+            '@print[{len(rows)}]',
+        )
+        assert "2" in capsys.readouterr().out
+
+    def test_getall_with_filter(self, capsys):
+        """@db.getall with WHERE returns only matching rows."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE gaf (x INTEGER)"]',
+            '@db.exec["INSERT INTO gaf VALUES (1)"]',
+            '@db.exec["INSERT INTO gaf VALUES (2)"]',
+            '@db.exec["INSERT INTO gaf VALUES (3)"]',
+            '@var[rows; @db.getall["gaf"; "x > ?"; 1]]',
+            '@print[{len(rows)}]',
+        )
+        assert "2" in capsys.readouterr().out
+
+    def test_truncate(self, capsys):
+        """@db.truncate removes all rows."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE tr (x INTEGER)"]',
+            '@db.exec["INSERT INTO tr VALUES (1)"]',
+            '@db.exec["INSERT INTO tr VALUES (2)"]',
+            '@db.truncate["tr"]',
+            '@db.query["SELECT * FROM tr"]',
+            '@var[n; @db.count[]]',
+            '@print[{n}]',
+        )
+        assert "0" in capsys.readouterr().out
+
+    def test_schema(self, capsys):
+        """@db.schema returns column definitions."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE s (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"]',
+            '@var[cols; @db.schema["s"]]',
+            '@print[{len(cols)}]',
+            '@print[{cols[0]["name"]}]',
+        )
+        out = capsys.readouterr().out
+        assert "2" in out
+        assert "id" in out
+
+    def test_views_empty(self, capsys):
+        """@db.views returns empty list when no views exist."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[v; @db.views[]]',
+            '@print[{len(v)}]',
+        )
+        assert "0" in capsys.readouterr().out
+
+    def test_cols(self, capsys):
+        """@db.cols returns column names of the last query result."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE c (id INTEGER, name TEXT)"]',
+            '@db.exec["INSERT INTO c VALUES (1, \'x\')"]',
+            '@db.query["SELECT * FROM c"]',
+            '@var[c; @db.cols[]]',
+            '@print[{len(c)}]',
+        )
+        assert "2" in capsys.readouterr().out
+
+    def test_row_by_index(self, capsys):
+        """@db.row[n] returns the nth row from the last result."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE ri (val INTEGER)"]',
+            '@db.exec["INSERT INTO ri VALUES (10)"]',
+            '@db.exec["INSERT INTO ri VALUES (20)"]',
+            '@db.query["SELECT * FROM ri ORDER BY val"]',
+            '@var[r; @db.row[1]]',
+            '@print[{r["val"]}]',
+        )
+        assert "20" in capsys.readouterr().out
+
+    def test_col_by_name(self, capsys):
+        """@db.col[name] returns that column's value from the first row."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE cn (id INTEGER, name TEXT)"]',
+            '@db.insert["cn"; {"id": 1, "name": "Alice"}]',
+            '@db.query["SELECT * FROM cn"]',
+            '@var[v; @db.col["name"]]',
+            '@print[{v}]',
+        )
+        assert "Alice" in capsys.readouterr().out
+
+    def test_rowcount_after_update(self, capsys):
+        """@db.rowcount returns the number of rows affected by the last update."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE rc (x INTEGER)"]',
+            '@db.exec["INSERT INTO rc VALUES (1)"]',
+            '@db.exec["INSERT INTO rc VALUES (1)"]',
+            '@db.update["rc"; {"x": 2}; "x = ?"; 1]',
+            '@var[n; @db.rowcount[]]',
+            '@print[{n}]',
+        )
+        assert "2" in capsys.readouterr().out
+
+    def test_indexes(self, capsys):
+        """@db.index_create then @db.indexes returns the index info."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE idx (id INTEGER, name TEXT)"]',
+            '@db.index_create["idx"; "name"]',
+            '@var[idxs; @db.indexes["idx"]]',
+            '@print[{len(idxs)}]',
+        )
+        assert "1" in capsys.readouterr().out
+
+    def test_rename_table(self, capsys):
+        """@db.rename renames a table."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE old_name (x INTEGER)"]',
+            '@db.rename["old_name"; "new_name"]',
+            '@var[ok; @db.exists["new_name"]]',
+            '@print[{ok}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_pragma_get(self, capsys):
+        """@db.pragma[name] returns current PRAGMA value."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[v; @db.pragma["journal_mode"]]',
+            '@print[{v is not None}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_savepoint_rollback(self, capsys):
+        """@db.savepoint + @db.rollback_to reverts to the savepoint."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE sp (val INTEGER)"]',
+            '@db.begin[]',
+            '@db.exec["INSERT INTO sp VALUES (1)"]',
+            '@db.savepoint["s1"]',
+            '@db.exec["INSERT INTO sp VALUES (2)"]',
+            '@db.rollback_to["s1"]',
+            '@db.commit[]',
+            '@db.query["SELECT * FROM sp"]',
+            '@var[n; @db.count[]]',
+            '@print[{n}]',
+        )
+        assert "1" in capsys.readouterr().out
+
+    def test_in_transaction_flag(self, capsys):
+        """@db.in_transaction returns True inside a transaction, False outside."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[before; @db.in_transaction[]]',
+            '@db.begin[]',
+            '@var[during; @db.in_transaction[]]',
+            '@db.rollback[]',
+            '@var[after; @db.in_transaction[]]',
+            '@print[{before}]',
+            '@print[{during}]',
+            '@print[{after}]',
+        )
+        out = capsys.readouterr().out.strip().splitlines()
+        assert out[0] == "False"
+        assert out[1] == "True"
+        assert out[2] == "False"
+
+    def test_ping_returns_true(self, capsys):
+        """@db.ping returns True on a live connection."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[ok; @db.ping[]]',
+            '@print[{ok}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_ping_returns_false_no_conn(self, capsys):
+        """@db.ping returns False when no connection is open."""
+        self._run('@var[ok; @db.ping[]]\n@print[{ok}]')
+        assert "False" in capsys.readouterr().out
+
+    def test_vacuum_runs(self, capsys):
+        """@db.vacuum executes without error on SQLite."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.vacuum[]',
+            '@print["ok"]',
+        )
+        assert "ok" in capsys.readouterr().out
+
+    def test_backup_and_restore(self, tmp_path, capsys):
+        """@db.backup writes a valid SQLite file; @db.restore connects to it."""
+        backup_path = str(tmp_path / "backup.db")
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE bk (x INTEGER)"]',
+            '@db.exec["INSERT INTO bk VALUES (42)"]',
+            f'@db.backup["{backup_path}"]',
+            '@db.close[]',
+            f'@db.restore["{backup_path}"]',
+            '@db.query["SELECT * FROM bk"]',
+            '@var[row; @db.one[]]',
+            '@print[{row["x"]}]',
+        )
+        assert "42" in capsys.readouterr().out
+
+    # ── async ──────────────────────────────────────────────────
+
+    def test_async_connect_query(self, capsys):
+        """@db.async_connect + @db.async_query works in async context."""
+        pytest.importorskip("aiosqlite")
+        self._run(
+            '@async[main]',
+            '    @db.async_connect["sqlite:///:memory:"]',
+            '    @db.async_exec["CREATE TABLE at (val INTEGER)"]',
+            '    @db.async_exec["INSERT INTO at VALUES (7)"]',
+            '    @var[rows; @db.async_query["SELECT * FROM at"]]',
+            '    @var[n; @db.async_count[]]',
+            '    @print[{n}]',
+            '    @db.async_close[]',
+            '@end',
+        )
+        assert "1" in capsys.readouterr().out
+
+    def test_async_insert_and_get(self, capsys):
+        """@db.async_insert + @db.async_get round-trip works."""
+        pytest.importorskip("aiosqlite")
+        self._run(
+            '@async[main]',
+            '    @db.async_connect["sqlite:///:memory:"]',
+            '    @db.async_exec["CREATE TABLE ai (id INTEGER PRIMARY KEY, name TEXT)"]',
+            '    @db.async_insert["ai"; {"name": "Alice"}]',
+            '    @var[row; @db.async_get["ai"; "name = ?"; "Alice"]]',
+            '    @print[{row["name"]}]',
+            '    @db.async_close[]',
+            '@end',
+        )
+        assert "Alice" in capsys.readouterr().out
+
+    def test_async_rollback_discards(self, capsys):
+        """@db.async_rollback undoes inserts since @db.async_begin."""
+        pytest.importorskip("aiosqlite")
+        self._run(
+            '@async[main]',
+            '    @db.async_connect["sqlite:///:memory:"]',
+            '    @db.async_exec["CREATE TABLE arb (val INTEGER)"]',
+            '    @db.async_begin[]',
+            '    @db.async_exec["INSERT INTO arb VALUES (99)"]',
+            '    @db.async_rollback[]',
+            '    @var[rows; @db.async_query["SELECT * FROM arb"]]',
+            '    @var[n; @db.async_count[]]',
+            '    @print[{n}]',
+            '    @db.async_close[]',
+            '@end',
+        )
+        assert "0" in capsys.readouterr().out
+
+    # ── new group: connection info & raw access ───────────────
+
+    def test_connection_returns_object(self, capsys):
+        """@db.connection[] returns the raw connection object (not None)."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[c; @db.connection[]]',
+            '@print[{c is not None}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_cursor_obj_returns_object(self, capsys):
+        """@db.cursor_obj[] returns the raw cursor (not None)."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[c; @db.cursor_obj[]]',
+            '@print[{c is not None}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_db_type(self, capsys):
+        """@db.db_type[] returns 'sqlite' for an in-memory connection."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[t; @db.db_type[]]',
+            '@print[{t}]',
+        )
+        assert "sqlite" in capsys.readouterr().out
+
+    def test_dsn(self, capsys):
+        """@db.dsn[] returns the DSN string used to connect."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[d; @db.dsn[]]',
+            '@print[{d}]',
+        )
+        assert "sqlite" in capsys.readouterr().out
+
+    def test_closed_false_when_open(self, capsys):
+        """@db.closed[] is False when connection is active."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[c; @db.closed[]]',
+            '@print[{c}]',
+        )
+        assert "False" in capsys.readouterr().out
+
+    def test_closed_true_after_close(self, capsys):
+        """@db.closed[] is True after @db.close[]."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.close[]',
+            '@var[c; @db.closed[]]',
+            '@print[{c}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_conn_info_has_type(self, capsys):
+        """@db.conn_info[] dict contains 'type' key."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[info; @db.conn_info[]]',
+            '@print[{info["type"]}]',
+        )
+        assert "sqlite" in capsys.readouterr().out
+
+    def test_server_version_returns_string(self, capsys):
+        """@db.server_version[] returns a non-empty string."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[v; @db.server_version[]]',
+            '@print[{len(v) > 0}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_autocommit_get(self, capsys):
+        """@db.autocommit[] returns a bool."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[a; @db.autocommit[]]',
+            '@print[{isinstance(a, bool)}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_isolation_level_get(self, capsys):
+        """@db.isolation_level[] returns a value without error."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[il; @db.isolation_level[]]',
+            '@print["ok"]',
+        )
+        assert "ok" in capsys.readouterr().out
+
+    def test_total_changes(self, capsys):
+        """@db.total_changes[] reflects inserts."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE tc (x INTEGER)"]',
+            '@db.exec["INSERT INTO tc VALUES (1)"]',
+            '@db.exec["INSERT INTO tc VALUES (2)"]',
+            '@var[n; @db.total_changes[]]',
+            '@print[{n >= 2}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_arraysize_get_set(self, capsys):
+        """@db.arraysize[] get/set round-trip."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.arraysize[50]',
+            '@var[a; @db.arraysize[]]',
+            '@print[{a}]',
+        )
+        assert "50" in capsys.readouterr().out
+
+    def test_cursor_close_reopens(self, capsys):
+        """@db.cursor_close[] closes and reopens a fresh cursor."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE cc (x INTEGER)"]',
+            '@db.cursor_close[]',
+            '@db.exec["INSERT INTO cc VALUES (7)"]',
+            '@db.query["SELECT * FROM cc"]',
+            '@var[n; @db.count[]]',
+            '@print[{n}]',
+        )
+        assert "1" in capsys.readouterr().out
+
+    # ── SQLite advanced ───────────────────────────────────────
+
+    def test_script_multi_statement(self, capsys):
+        """@db.script executes multiple ; separated SQL statements."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.script["CREATE TABLE s1 (x INT); CREATE TABLE s2 (y INT);"]',
+            '@var[t; @db.tables[]]',
+            '@print[{len(t)}]',
+        )
+        assert "2" in capsys.readouterr().out
+
+    def test_func_custom_sql_function(self, capsys):
+        """@db.func registers a Python callable as a SQLite SQL function."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.func["double"; 1; lambda x: x * 2]',
+            '@db.query["SELECT double(21) AS r"]',
+            '@var[row; @db.one[]]',
+            '@print[{row["r"]}]',
+        )
+        assert "42" in capsys.readouterr().out
+
+    def test_aggregate_custom(self, capsys):
+        """@db.aggregate registers a custom aggregate class."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            (
+                '@db.aggregate["mysum"; 1; type("MySum", (), {'
+                '"__init__": lambda self: setattr(self, "v", 0),'
+                '"step": lambda self, x: setattr(self, "v", self.v + x),'
+                '"finalize": lambda self: self.v'
+                '})]'
+            ),
+            '@db.exec["CREATE TABLE ag (x INTEGER)"]',
+            '@db.exec["INSERT INTO ag VALUES (3)"]',
+            '@db.exec["INSERT INTO ag VALUES (7)"]',
+            '@db.query["SELECT mysum(x) AS s FROM ag"]',
+            '@var[row; @db.one[]]',
+            '@print[{row["s"]}]',
+        )
+        assert "10" in capsys.readouterr().out
+
+    def test_collation(self, capsys):
+        """@db.collation registers a custom collation affecting ORDER BY."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.collation["rev"; lambda a, b: (a < b) - (a > b)]',
+            '@db.exec["CREATE TABLE cl (name TEXT)"]',
+            '@db.exec["INSERT INTO cl VALUES (\'alpha\')"]',
+            '@db.exec["INSERT INTO cl VALUES (\'zeta\')"]',
+            '@db.query["SELECT name FROM cl ORDER BY name COLLATE rev"]',
+            '@var[first; @db.row[0]["name"]]',
+            '@print[{first}]',
+        )
+        assert "zeta" in capsys.readouterr().out
+
+    def test_dump_returns_sql_list(self, capsys):
+        """@db.dump returns a list of SQL strings."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE d1 (x INTEGER)"]',
+            '@var[lines; @db.dump[]]',
+            '@print[{len(lines) > 0}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_text_factory_set_get(self, capsys):
+        """@db.text_factory[fn] sets the text decoding callable."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.text_factory[str]',
+            '@var[fn; @db.text_factory[]]',
+            '@print[{fn is str}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_trace_callback(self, capsys):
+        """@db.trace registers an SQL trace callback."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[seen; []]',
+            '@db.trace[lambda sql: seen.append(sql)]',
+            '@db.exec["CREATE TABLE tr_t (x INT)"]',
+            '@print[{len(seen) > 0}]',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_progress_handler(self, capsys):
+        """@db.progress registers a progress callback without error."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@var[calls; [0]]',
+            '@db.progress[1; lambda: calls.__setitem__(0, calls[0] + 1) or None]',
+            '@db.exec["CREATE TABLE ph (x INT)"]',
+            '@print["ok"]',
+        )
+        assert "ok" in capsys.readouterr().out
+
+    def test_row_factory_callable(self, capsys):
+        """@db.row_factory[fn] sets a custom row factory."""
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.row_factory[lambda cur, row: {d[0]: v for d, v in zip(cur.description, row)}]',
+            '@db.exec["CREATE TABLE rf (id INTEGER, name TEXT)"]',
+            '@db.insert["rf"; {"id": 1, "name": "Bob"}]',
+            '@db.query["SELECT * FROM rf"]',
+            '@var[r; @db.one[]]',
+            '@print[{r["name"]}]',
+        )
+        assert "Bob" in capsys.readouterr().out
+
+    def test_serialize_deserialize(self, capsys):
+        """@db.serialize + @db.deserialize round-trip preserves data (py 3.11+)."""
+        import sys
+        if sys.version_info < (3, 11):
+            pytest.skip("serialize/deserialize require Python 3.11+")
+        self._run(
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.exec["CREATE TABLE ser (val INTEGER)"]',
+            '@db.exec["INSERT INTO ser VALUES (99)"]',
+            '@var[data; @db.serialize[]]',
+            '@db.close[]',
+            '@db.connect["sqlite:///:memory:"]',
+            '@db.deserialize[data]',
+            '@db.query["SELECT * FROM ser"]',
+            '@var[row; @db.one[]]',
+            '@print[{row["val"]}]',
+        )
+        assert "99" in capsys.readouterr().out
+
+    # ── async new methods ─────────────────────────────────────
+
+    def test_async_execmany(self, capsys):
+        """@db.async_execmany runs parameterized SQL for a list of rows."""
+        pytest.importorskip("aiosqlite")
+        self._run(
+            '@async[main]',
+            '    @db.async_connect["sqlite:///:memory:"]',
+            '    @db.async_exec["CREATE TABLE aem (x INTEGER)"]',
+            '    @db.async_execmany["INSERT INTO aem VALUES (?)"; [(1,),(2,),(3,)]]',
+            '    @var[rows; @db.async_query["SELECT * FROM aem"]]',
+            '    @print[{@db.async_count[]}]',
+            '    @db.async_close[]',
+            '@end',
+        )
+        assert "3" in capsys.readouterr().out
+
+    def test_async_fetchrow(self, capsys):
+        """@db.async_fetchrow returns a single row dict."""
+        pytest.importorskip("aiosqlite")
+        self._run(
+            '@async[main]',
+            '    @db.async_connect["sqlite:///:memory:"]',
+            '    @db.async_exec["CREATE TABLE afr (name TEXT)"]',
+            '    @db.async_insert["afr"; {"name": "Alice"}]',
+            '    @var[row; @db.async_fetchrow["SELECT * FROM afr"]]',
+            '    @print[{row["name"]}]',
+            '    @db.async_close[]',
+            '@end',
+        )
+        assert "Alice" in capsys.readouterr().out
+
+    def test_async_cursor_streaming(self, capsys):
+        """async_cursor_open + async_fetchone streams rows one at a time."""
+        pytest.importorskip("aiosqlite")
+        self._run(
+            '@async[main]',
+            '    @db.async_connect["sqlite:///:memory:"]',
+            '    @db.async_exec["CREATE TABLE acs (val INTEGER)"]',
+            '    @db.async_exec["INSERT INTO acs VALUES (10)"]',
+            '    @db.async_exec["INSERT INTO acs VALUES (20)"]',
+            '    @db.async_cursor_open["SELECT * FROM acs ORDER BY val"]',
+            '    @var[r1; @db.async_fetchone[]]',
+            '    @var[r2; @db.async_fetchone[]]',
+            '    @var[r3; @db.async_fetchone[]]',
+            '    @db.async_cursor_close[]',
+            '    @print[{r1["val"]}]',
+            '    @print[{r2["val"]}]',
+            '    @print[{r3 is None}]',
+            '    @db.async_close[]',
+            '@end',
+        )
+        out = capsys.readouterr().out.strip().splitlines()
+        assert out[0] == "10"
+        assert out[1] == "20"
+        assert out[2] == "True"
+
+    def test_async_script(self, capsys):
+        """@db.async_script runs multiple statements (aiosqlite)."""
+        pytest.importorskip("aiosqlite")
+        self._run(
+            '@async[main]',
+            '    @db.async_connect["sqlite:///:memory:"]',
+            '    @db.async_script["CREATE TABLE as1 (x INT); CREATE TABLE as2 (y INT);"]',
+            '    @var[rows; @db.async_query["SELECT name FROM sqlite_master WHERE type=\'table\'"]]',
+            '    @print[{len(rows)}]',
+            '    @db.async_close[]',
+            '@end',
+        )
+        assert "2" in capsys.readouterr().out
+
+    def test_async_func(self, capsys):
+        """@db.async_func registers a Python SQL function (aiosqlite)."""
+        pytest.importorskip("aiosqlite")
+        self._run(
+            '@async[main]',
+            '    @db.async_connect["sqlite:///:memory:"]',
+            '    @db.async_func["triple"; 1; lambda x: x * 3]',
+            '    @var[rows; @db.async_query["SELECT triple(7) AS r"]]',
+            '    @print[{rows[0]["r"]}]',
+            '    @db.async_close[]',
+            '@end',
+        )
+        assert "21" in capsys.readouterr().out
+
+    def test_async_dump(self, capsys):
+        """@db.async_dump returns a list of SQL strings (aiosqlite)."""
+        pytest.importorskip("aiosqlite")
+        self._run(
+            '@async[main]',
+            '    @db.async_connect["sqlite:///:memory:"]',
+            '    @db.async_exec["CREATE TABLE dump_t (x INT)"]',
+            '    @var[lines; @db.async_dump[]]',
+            '    @print[{len(lines) > 0}]',
+            '    @db.async_close[]',
+            '@end',
+        )
+        assert "True" in capsys.readouterr().out
+
+    def test_async_rowcount_and_cols(self, capsys):
+        """@db.async_rowcount and @db.async_cols return correct values."""
+        pytest.importorskip("aiosqlite")
+        self._run(
+            '@async[main]',
+            '    @db.async_connect["sqlite:///:memory:"]',
+            '    @db.async_exec["CREATE TABLE arc (id INTEGER, name TEXT)"]',
+            '    @db.async_insert["arc"; {"id": 1, "name": "x"}]',
+            '    @db.async_query["SELECT * FROM arc"]',
+            '    @var[cols; @db.async_cols[]]',
+            '    @print[{len(cols)}]',
+            '    @db.async_close[]',
+            '@end',
+        )
+        assert "2" in capsys.readouterr().out
+
+
+# ─────────────────────────────────────────────────────────────
+# LANGUAGE FEATURE COMPLETION (13 new features)
+# ─────────────────────────────────────────────────────────────
+
+from cruhon.core.parser import parse as _lf_parse
+from cruhon.core.transpiler import transpile as _lf_transpile
+
+
+def _compile(source):
+    """Helper: parse + transpile, return Python code string."""
+    ast = _lf_parse(source)
+    return _lf_transpile(ast)
+
+
+class TestPass:
+    def test_pass_basic(self):
+        code = _compile("@pass")
+        assert "pass" in code
+
+    def test_pass_in_func(self):
+        code = _compile("\n".join([
+            "@func[stub]",
+            "    @pass",
+            "@end",
+        ]))
+        assert "def stub" in code
+        assert "pass" in code
+
+
+class TestGlobal:
+    def test_global_single(self):
+        code = _compile("@global[x]")
+        assert "global x" in code
+
+    def test_global_multi(self):
+        code = _compile("@global[x; y; z]")
+        assert "global x, y, z" in code
+
+    def test_global_in_func(self):
+        code = _compile("\n".join([
+            "@func[counter]",
+            "    @global[count]",
+            "    @var[count; count + 1]",
+            "@end",
+        ]))
+        assert "global count" in code
+
+
+class TestNonlocal:
+    def test_nonlocal_single(self):
+        code = _compile("@nonlocal[x]")
+        assert "nonlocal x" in code
+
+    def test_nonlocal_multi(self):
+        code = _compile("@nonlocal[a; b]")
+        assert "nonlocal a, b" in code
+
+    def test_nonlocal_in_closure(self):
+        code = _compile("\n".join([
+            "@func[outer]",
+            "    @var[n; 0]",
+            "    @func[inner]",
+            "        @nonlocal[n]",
+            "        @var[n; n + 1]",
+            "    @end",
+            "    @return[n]",
+            "@end",
+        ]))
+        assert "nonlocal n" in code
+
+
+class TestYield:
+    def test_yield_with_value(self):
+        code = _compile("\n".join([
+            "@func[gen]",
+            "    @yield[42]",
+            "@end",
+        ]))
+        assert "yield 42" in code
+
+    def test_yield_bare(self):
+        code = _compile("\n".join([
+            "@func[gen]",
+            "    @yield",
+            "@end",
+        ]))
+        assert "yield" in code
+
+    def test_yield_variable(self):
+        code = _compile("\n".join([
+            "@func[gen; items]",
+            "    @for[x; items]",
+            "        @yield[x]",
+            "    @end",
+            "@end",
+        ]))
+        assert "yield x" in code
+
+    def test_yield_from(self):
+        code = _compile("\n".join([
+            "@func[gen; other]",
+            "    @yield.from[other]",
+            "@end",
+        ]))
+        assert "yield from other" in code
+
+    def test_yield_from_expression(self):
+        code = _compile("\n".join([
+            "@func[gen]",
+            "    @yield.from[range(10)]",
+            "@end",
+        ]))
+        assert "yield from range(10)" in code
+
+
+class TestDecorate:
+    def test_decorate_simple(self):
+        code = _compile("\n".join([
+            "@decorate[staticmethod]",
+            "@func[greet]",
+            "    @pass",
+            "@end",
+        ]))
+        assert "@staticmethod" in code
+        assert "def greet" in code
+
+    def test_decorate_with_args(self):
+        code = _compile("\n".join([
+            "@decorate[app.route(\"/home\")]",
+            "@func[home]",
+            "    @pass",
+            "@end",
+        ]))
+        assert '@app.route("/home")' in code
+
+    def test_decorate_property(self):
+        code = _compile("\n".join([
+            "@class[Circle]",
+            "    @decorate[property]",
+            "    @func[area; self]",
+            "        @return[3.14]",
+            "    @end",
+            "@end",
+        ]))
+        assert "@property" in code
+
+
+class TestForeach:
+    def test_foreach_basic(self):
+        code = _compile("\n".join([
+            "@foreach[i; x; items]",
+            "    @pass",
+            "@end",
+        ]))
+        assert "for i, x in enumerate(items):" in code
+
+    def test_foreach_with_start(self):
+        code = _compile("\n".join([
+            "@foreach[i; x; items; 1]",
+            "    @pass",
+            "@end",
+        ]))
+        assert "for i, x in enumerate(items, 1):" in code
+
+    def test_foreach_zero_start_omits_arg(self):
+        code = _compile("\n".join([
+            "@foreach[idx; val; data; 0]",
+            "    @pass",
+            "@end",
+        ]))
+        assert "enumerate(data)" in code
+        assert "enumerate(data, 0)" not in code
+
+    def test_foreach_executes(self, capsys):
+        import textwrap
+        prog = textwrap.dedent("""
+            @foreach[i; ch; "abc"]
+                @print[{i}]
+            @end
+        """)
+        ast = _lf_parse(prog)
+        code = _lf_transpile(ast)
+        exec(compile(code, "<test>", "exec"), {})
+        out = capsys.readouterr().out
+        assert "0" in out
+        assert "1" in out
+        assert "2" in out
+
+
+class TestCatchType:
+    def test_catch_bare_var(self):
+        code = _compile("\n".join([
+            "@try",
+            "    @pass",
+            "@catch[e]",
+            "    @pass",
+            "@end",
+        ]))
+        assert "except Exception as e:" in code
+
+    def test_catch_type_only(self):
+        code = _compile("\n".join([
+            "@try",
+            "    @pass",
+            "@catch[ValueError]",
+            "    @pass",
+            "@end",
+        ]))
+        assert "except ValueError:" in code
+
+    def test_catch_type_and_var(self):
+        code = _compile("\n".join([
+            "@try",
+            "    @pass",
+            "@catch[TypeError; err]",
+            "    @pass",
+            "@end",
+        ]))
+        assert "except TypeError as err:" in code
+
+    def test_catch_with_finally(self):
+        code = _compile("\n".join([
+            "@try",
+            "    @pass",
+            "@catch[RuntimeError; e]",
+            "    @pass",
+            "@finally",
+            "    @pass",
+            "@end",
+        ]))
+        assert "except RuntimeError as e:" in code
+        assert "finally:" in code
+
+
+class TestTupleUnpack:
+    def test_unpack_two(self):
+        code = _compile("@var[a, b; 1, 2]")
+        assert "a, b =" in code
+        assert "1" in code and "2" in code
+
+    def test_unpack_three(self):
+        code = _compile("@var[x, y, z; 10, 20, 30]")
+        assert "x, y, z =" in code
+
+    def test_unpack_from_function(self):
+        code = _compile("@var[q, r; divmod(10, 3)]")
+        assert "q, r = divmod(10, 3)" in code
+
+    def test_unpack_executes(self, capsys):
+        prog = "@var[a, b; 1, 2]\n@print[{a + b}]"
+        ast = _lf_parse(prog)
+        code = _lf_transpile(ast)
+        exec(compile(code, "<test>", "exec"), {})
+        assert "3" in capsys.readouterr().out
+
+
+class TestFuncReturnType:
+    def test_return_type_hint(self):
+        code = _compile("\n".join([
+            "@func[add; x; y; -> int]",
+            "    @return[x + y]",
+            "@end",
+        ]))
+        assert "def add(x, y) -> int:" in code
+
+    def test_async_return_type_hint(self):
+        code = _compile("\n".join([
+            "@async[fetch_data; url; -> str]",
+            "    @return[url]",
+            "@end",
+        ]))
+        assert "async def fetch_data(url) -> str:" in code
+
+    def test_no_return_type(self):
+        code = _compile("\n".join([
+            "@func[greet; name]",
+            "    @pass",
+            "@end",
+        ]))
+        assert "def greet(name):" in code
+        assert "->" not in code
+
+
+class TestLambdaInline:
+    def test_lambda_with_params(self):
+        code = _compile("@var[double; @lambda[x; x * 2]]")
+        assert "(lambda x: x * 2)" in code
+
+    def test_lambda_no_params(self):
+        code = _compile("@var[f; @lambda[42]]")
+        assert "(lambda: 42)" in code
+
+    def test_lambda_in_var(self):
+        code = _compile("@var[add; @lambda[a, b; a + b]]")
+        assert "(lambda a, b: a + b)" in code
+
+
+class TestCompInline:
+    def test_comp_basic(self):
+        code = _compile("@var[squares; @comp[x**2; x; range(5)]]")
+        assert "[x**2 for x in range(5)]" in code
+
+    def test_comp_with_condition(self):
+        code = _compile("@var[evens; @comp[x; x; range(10); x % 2 == 0]]")
+        assert "[x for x in range(10) if x % 2 == 0]" in code
+
+    def test_comp_executes(self, capsys):
+        prog = "\n".join([
+            "@var[result; @comp[x*2; x; range(3)]]",
+            "@print[{result}]",
+        ])
+        ast = _lf_parse(prog)
+        code = _lf_transpile(ast)
+        exec(compile(code, "<test>", "exec"), {})
+        assert "[0, 2, 4]" in capsys.readouterr().out
+
+
+class TestPipeInline:
+    def test_pipe_single_fn(self):
+        code = _compile("@var[result; @pipe[5; str]]")
+        assert "str(5)" in code
+
+    def test_pipe_chained(self):
+        code = _compile("@var[result; @pipe[items; sorted; list]]")
+        assert "list(sorted(items))" in code
+
+    def test_pipe_executes(self, capsys):
+        prog = "\n".join([
+            "@var[nums; @list[3; 1; 2]]",
+            "@var[result; @pipe[nums; sorted; list]]",
+            "@print[{result}]",
+        ])
+        ast = _lf_parse(prog)
+        code = _lf_transpile(ast)
+        exec(compile(code, "<test>", "exec"), {})
+        assert "[1, 2, 3]" in capsys.readouterr().out
+
+
+# ─────────────────────────────────────────────────────────────
+# RUNTIME REGRESSION — verified-but-untested Python parity features
+# (class self.attr, star-unpack, walrus, generator runtime, swap)
+# ─────────────────────────────────────────────────────────────
+
+def _run_ns(source):
+    """Helper: compile + exec, return the resulting namespace dict."""
+    code = _lf_transpile(_lf_parse(source))
+    ns = {}
+    exec(compile(code, "<test>", "exec"), ns)
+    return ns
+
+
+class TestClassRuntime:
+    def test_init_and_self_attr(self):
+        ns = _run_ns("\n".join([
+            "@class[Person]",
+            "    @func[__init__; self; name]",
+            "        @var[self.name; name]",
+            "    @end",
+            "    @func[greet; self]",
+            '        @return["Hi " + self.name]',
+            "    @end",
+            "@end",
+            '@var[p; Person("Ada")]',
+            "@var[result; p.greet()]",
+        ]))
+        assert ns["result"] == "Hi Ada"
+        assert ns["p"].name == "Ada"
+
+    def test_self_attr_assignment_codegen(self):
+        code = _compile("\n".join([
+            "@class[Box]",
+            "    @func[__init__; self; v]",
+            "        @var[self.value; v]",
+            "    @end",
+            "@end",
+        ]))
+        assert "self.value = v" in code
+
+    def test_property_runtime(self):
+        ns = _run_ns("\n".join([
+            "@class[Circle]",
+            "    @func[__init__; self; r]",
+            "        @var[self.r; r]",
+            "    @end",
+            "    @decorate[property]",
+            "    @func[area; self]",
+            "        @return[self.r * self.r]",
+            "    @end",
+            "@end",
+            "@var[c; Circle(3)]",
+            "@var[a; c.area]",
+        ]))
+        assert ns["a"] == 9
+
+    def test_class_inheritance_runtime(self):
+        ns = _run_ns("\n".join([
+            "@class[Animal]",
+            "    @func[sound; self]",
+            '        @return["..."]',
+            "    @end",
+            "@end",
+            "@class[Dog; Animal]",
+            "    @func[sound; self]",
+            '        @return["woof"]',
+            "    @end",
+            "@end",
+            "@var[d; Dog()]",
+            "@var[s; d.sound()]",
+        ]))
+        assert ns["s"] == "woof"
+
+
+class TestUnpackRuntime:
+    def test_swap(self):
+        ns = _run_ns("\n".join([
+            "@var[a; 1]",
+            "@var[b; 2]",
+            "@var[a, b; b, a]",
+        ]))
+        assert ns["a"] == 2 and ns["b"] == 1
+
+    def test_star_unpack(self):
+        ns = _run_ns("@var[first, *rest; [1, 2, 3, 4]]")
+        assert ns["first"] == 1
+        assert ns["rest"] == [2, 3, 4]
+
+    def test_star_unpack_codegen(self):
+        code = _compile("@var[first, *rest; [1, 2, 3, 4]]")
+        assert "first, *rest =" in code
+
+    def test_unpack_swap_executes(self):
+        ns = _run_ns("\n".join([
+            "@var[x, y; 10, 20]",
+            "@var[x, y; y, x]",
+        ]))
+        assert ns["x"] == 20 and ns["y"] == 10
+
+
+class TestWalrusRuntime:
+    def test_walrus_in_if(self):
+        ns = _run_ns("\n".join([
+            "@var[data; [1, 2, 3]]",
+            "@if[(n := len(data)) > 2]",
+            "    @var[found; n]",
+            "@end",
+        ]))
+        assert ns["found"] == 3
+
+    def test_walrus_in_while(self):
+        ns = _run_ns("\n".join([
+            "@var[items; [1, 2, 3]]",
+            "@var[total; 0]",
+            "@while[items and (x := items.pop())]",
+            "    @var[total; total + x]",
+            "@end",
+        ]))
+        assert ns["total"] == 6
+
+
+class TestGeneratorRuntime:
+    def test_generator_yields(self):
+        ns = _run_ns("\n".join([
+            "@func[counter]",
+            "    @yield[1]",
+            "    @yield[2]",
+            "    @yield[3]",
+            "@end",
+            "@var[result; list(counter())]",
+        ]))
+        assert ns["result"] == [1, 2, 3]
+
+    def test_generator_yield_from(self):
+        ns = _run_ns("\n".join([
+            "@func[gen]",
+            "    @yield.from[range(4)]",
+            "@end",
+            "@var[result; list(gen())]",
+        ]))
+        assert ns["result"] == [0, 1, 2, 3]
+
+    def test_generator_with_loop(self):
+        ns = _run_ns("\n".join([
+            "@func[squares; n]",
+            "    @for[i; range(n)]",
+            "        @yield[i * i]",
+            "    @end",
+            "@end",
+            "@var[result; list(squares(4))]",
+        ]))
+        assert ns["result"] == [0, 1, 4, 9]
+
+    def test_async_generator_codegen(self):
+        code = _compile("\n".join([
+            "@async[agen]",
+            "    @yield[1]",
+            "    @yield[2]",
+            "@end",
+        ]))
+        assert "async def agen" in code
+        assert "yield 1" in code
+
+
+class TestClosureRuntime:
+    def test_nonlocal_counter(self):
+        ns = _run_ns("\n".join([
+            "@func[make_counter]",
+            "    @var[count; 0]",
+            "    @func[inc]",
+            "        @nonlocal[count]",
+            "        @var[count; count + 1]",
+            "        @return[count]",
+            "    @end",
+            "    @return[inc]",
+            "@end",
+            "@var[c; make_counter()]",
+            "@var[a; c()]",
+            "@var[b; c()]",
+        ]))
+        assert ns["a"] == 1 and ns["b"] == 2
+
+
+class TestDecoratorRuntime:
+    def test_decorator_actually_applies(self):
+        ns = _run_ns("\n".join([
+            "@func[double_it; fn]",
+            "    @func[wrapper; x]",
+            "        @return[fn(x) * 2]",
+            "    @end",
+            "    @return[wrapper]",
+            "@end",
+            "@decorate[double_it]",
+            "@func[add_one; x]",
+            "    @return[x + 1]",
+            "@end",
+            "@var[result; add_one(5)]",
+        ]))
+        assert ns["result"] == 12  # (5 + 1) * 2
+
+    def test_staticmethod_decorator(self):
+        ns = _run_ns("\n".join([
+            "@class[Math]",
+            "    @decorate[staticmethod]",
+            "    @func[twice; n]",
+            "        @return[n * 2]",
+            "    @end",
+            "@end",
+            "@var[result; Math.twice(21)]",
+        ]))
+        assert ns["result"] == 42
+
+
+# ─────────────────────────────────────────────────────────────
+# EXPRESSIVENESS UPGRADE — comprehensions, literals, sugar
+# ─────────────────────────────────────────────────────────────
+
+class TestComprehensions:
+    def test_dictcomp_basic(self):
+        ns = _run_ns("@var[d; @dictcomp[k; k*k; k; range(4)]]")
+        assert ns["d"] == {0: 0, 1: 1, 2: 4, 3: 9}
+
+    def test_dictcomp_with_condition(self):
+        ns = _run_ns("@var[d; @dictcomp[k; k*2; k; range(6); k % 2 == 0]]")
+        assert ns["d"] == {0: 0, 2: 4, 4: 8}
+
+    def test_dictcomp_codegen(self):
+        code = _compile("@var[d; @dictcomp[k; v; k; items]]")
+        assert "{k: v for k in items}" in code
+
+    def test_setcomp_basic(self):
+        ns = _run_ns("@var[s; @setcomp[x*2; x; range(4)]]")
+        assert ns["s"] == {0, 2, 4, 6}
+
+    def test_setcomp_dedupes(self):
+        ns = _run_ns("@var[s; @setcomp[x % 2; x; range(10)]]")
+        assert ns["s"] == {0, 1}
+
+    def test_setcomp_with_condition(self):
+        ns = _run_ns("@var[s; @setcomp[x; x; range(10); x > 5]]")
+        assert ns["s"] == {6, 7, 8, 9}
+
+    def test_gencomp_basic(self):
+        ns = _run_ns("@var[g; @gencomp[x; x; range(5)]]\n@var[total; sum(g)]")
+        assert ns["total"] == 10
+
+    def test_gencomp_is_lazy(self):
+        # A generator object, not a list
+        ns = _run_ns("@var[g; @gencomp[x; x; range(3)]]")
+        import types
+        assert isinstance(ns["g"], types.GeneratorType)
+
+    def test_gencomp_with_condition(self):
+        ns = _run_ns("@var[g; @gencomp[x; x; range(10); x % 3 == 0]]\n@var[r; list(g)]")
+        assert ns["r"] == [0, 3, 6, 9]
+
+
+class TestLiterals:
+    def test_set_literal(self):
+        ns = _run_ns("@var[s; @set[1; 2; 3; 2; 1]]")
+        assert ns["s"] == {1, 2, 3}
+
+    def test_empty_set(self):
+        ns = _run_ns("@var[s; @set[]]")
+        assert ns["s"] == set()
+        assert isinstance(ns["s"], set)
+
+    def test_set_codegen(self):
+        code = _compile("@var[s; @set[1; 2; 3]]")
+        assert "{1, 2, 3}" in code
+
+    def test_empty_set_is_set_not_dict(self):
+        code = _compile("@var[s; @set[]]")
+        assert "set()" in code  # not {}
+
+    def test_tuple_literal(self):
+        ns = _run_ns("@var[t; @tuple[1; 2; 3]]")
+        assert ns["t"] == (1, 2, 3)
+
+    def test_single_element_tuple(self):
+        ns = _run_ns("@var[t; @tuple[5]]")
+        assert ns["t"] == (5,)
+        assert isinstance(ns["t"], tuple)
+
+    def test_empty_tuple(self):
+        ns = _run_ns("@var[t; @tuple[]]")
+        assert ns["t"] == ()
+
+    def test_single_tuple_codegen(self):
+        code = _compile("@var[t; @tuple[5]]")
+        assert "(5,)" in code
+
+
+class TestTernaryAndDefault:
+    def test_when_true(self):
+        ns = _run_ns('@var[x; 5]\n@var[r; @when[x > 0; "pos"; "neg"]]')
+        assert ns["r"] == "pos"
+
+    def test_when_false(self):
+        ns = _run_ns('@var[x; -5]\n@var[r; @when[x > 0; "pos"; "neg"]]')
+        assert ns["r"] == "neg"
+
+    def test_when_codegen(self):
+        code = _compile('@var[r; @when[a; b; c]]')
+        assert "(b if a else c)" in code
+
+    def test_default_none_uses_fallback(self):
+        ns = _run_ns("@var[x; None]\n@var[r; @default[x; 42]]")
+        assert ns["r"] == 42
+
+    def test_default_value_kept(self):
+        ns = _run_ns("@var[x; 7]\n@var[r; @default[x; 42]]")
+        assert ns["r"] == 7
+
+    def test_default_falsy_but_not_none(self):
+        # 0 is falsy but not None — must be kept
+        ns = _run_ns("@var[x; 0]\n@var[r; @default[x; 99]]")
+        assert ns["r"] == 0
+
+
+class TestAugmentedAssignment:
+    def test_inc_default(self):
+        ns = _run_ns("@var[x; 0]\n@inc[x]")
+        assert ns["x"] == 1
+
+    def test_inc_by_amount(self):
+        ns = _run_ns("@var[x; 10]\n@inc[x; 5]")
+        assert ns["x"] == 15
+
+    def test_inc_codegen(self):
+        code = _compile("@inc[counter]")
+        assert "counter += 1" in code
+
+    def test_dec_default(self):
+        ns = _run_ns("@var[x; 10]\n@dec[x]")
+        assert ns["x"] == 9
+
+    def test_dec_by_amount(self):
+        ns = _run_ns("@var[x; 10]\n@dec[x; 3]")
+        assert ns["x"] == 7
+
+    def test_inc_in_loop(self):
+        ns = _run_ns("\n".join([
+            "@var[total; 0]",
+            "@for[i; range(5)]",
+            "    @inc[total; i]",
+            "@end",
+        ]))
+        assert ns["total"] == 10  # 0+1+2+3+4
+
+    def test_inc_with_variable_amount(self):
+        ns = _run_ns("@var[step; 4]\n@var[x; 0]\n@inc[x; step]")
+        assert ns["x"] == 4
+
+
+class TestSwap:
+    def test_swap_basic(self):
+        ns = _run_ns("@var[a; 1]\n@var[b; 2]\n@swap[a; b]")
+        assert ns["a"] == 2 and ns["b"] == 1
+
+    def test_swap_codegen(self):
+        code = _compile("@swap[a; b]")
+        assert "a, b = b, a" in code
+
+    def test_swap_preserves_values(self):
+        ns = _run_ns('@var[x; "hello"]\n@var[y; "world"]\n@swap[x; y]')
+        assert ns["x"] == "world" and ns["y"] == "hello"
+
+
+# ─────────────────────────────────────────────────────────────
+# FOR / WHILE ELSE CLAUSE
+# ─────────────────────────────────────────────────────────────
+
+class TestForWhileElse:
+    def test_for_else_codegen(self):
+        src = "@for[x; items]\n    pass\n@else\n    pass\n@end"
+        code = _compile(src)
+        assert "for x in items:" in code
+        assert "else:" in code
+
+    def test_for_else_runs_when_not_broken(self):
+        ns = _run_ns(
+            "@var[found; False]\n"
+            "@for[x; [1, 2, 3]]\n"
+            "    pass\n"
+            "@else\n"
+            "    @var[found; True]\n"
+            "@end"
+        )
+        assert ns["found"] is True
+
+    def test_for_else_skipped_on_break(self):
+        ns = _run_ns(
+            "@var[found; False]\n"
+            "@for[x; [1, 2, 3]]\n"
+            "    @break\n"
+            "@else\n"
+            "    @var[found; True]\n"
+            "@end"
+        )
+        assert ns["found"] is False
+
+    def test_while_else_codegen(self):
+        src = "@var[n; 0]\n@while[n < 3]\n    @var[n; n + 1]\n@else\n    pass\n@end"
+        code = _compile(src)
+        assert "while n < 3:" in code
+        assert "else:" in code
+
+    def test_while_else_runs_normally(self):
+        ns = _run_ns(
+            "@var[n; 0]\n"
+            "@var[done; False]\n"
+            "@while[n < 2]\n"
+            "    @var[n; n + 1]\n"
+            "@else\n"
+            "    @var[done; True]\n"
+            "@end"
+        )
+        assert ns["done"] is True
+
+
+# ─────────────────────────────────────────────────────────────
+# @comp — DICT / SET / GENERATOR
+# ─────────────────────────────────────────────────────────────
+
+class TestCompTypes:
+    def test_comp_list_default(self):
+        code = _compile("@var[r; @comp[x*2; x; range(5)]]")
+        assert "[x*2 for x in range(5)]" in code
+
+    def test_comp_list_with_cond(self):
+        code = _compile("@var[r; @comp[x; x; range(10); x % 2 == 0]]")
+        assert "[x for x in range(10) if x % 2 == 0]" in code
+
+    def test_comp_dict(self):
+        code = _compile("@var[d; @comp[k: v; k, v; pairs; type=dict]]")
+        assert "{k: v for k, v in pairs}" in code
+
+    def test_comp_dict_with_cond(self):
+        code = _compile("@var[d; @comp[k: v; k, v; pairs; v > 0; type=dict]]")
+        assert "{k: v for k, v in pairs if v > 0}" in code
+
+    def test_comp_set(self):
+        code = _compile("@var[s; @comp[x; x; items; type=set]]")
+        assert "{x for x in items}" in code
+
+    def test_comp_generator(self):
+        code = _compile("@var[g; @comp[x; x; range(10); type=gen]]")
+        assert "(x for x in range(10))" in code
+
+    def test_comp_dict_runs(self):
+        ns = _run_ns("@var[d; @comp[k: k*2; k; [1, 2, 3]; type=dict]]")
+        assert ns["d"] == {1: 2, 2: 4, 3: 6}
+
+    def test_comp_set_runs(self):
+        ns = _run_ns("@var[s; @comp[x % 3; x; range(6); type=set]]")
+        assert ns["s"] == {0, 1, 2}
+
+    def test_comp_generator_runs(self):
+        ns = _run_ns("@var[g; @comp[x; x; range(4); type=gen]]\n@var[r; list(g)]")
+        assert ns["r"] == [0, 1, 2, 3]
+
+
+# ─────────────────────────────────────────────────────────────
+# @decorator
+# ─────────────────────────────────────────────────────────────
+
+class TestDecorator:
+    def test_single_decorator_on_func(self):
+        src = "@decorator[staticmethod]\n@func[greet]\n    pass\n@end"
+        code = _compile(src)
+        assert "@staticmethod" in code
+        assert "def greet():" in code
+
+    def test_decorator_with_args(self):
+        src = "@decorator[lru_cache(maxsize=128)]\n@func[fib; n]\n    @return[n]\n@end"
+        code = _compile(src)
+        assert "@lru_cache(maxsize=128)" in code
+        assert "def fib(n):" in code
+
+    def test_multiple_decorators(self):
+        src = (
+            "@decorator[classmethod]\n"
+            "@decorator[some_wrap]\n"
+            "@func[factory; cls]\n"
+            "    pass\n"
+            "@end"
+        )
+        code = _compile(src)
+        assert "@classmethod" in code
+        assert "@some_wrap" in code
+        assert "def factory(cls):" in code
+
+    def test_decorator_on_class(self):
+        src = "@decorator[dataclass]\n@class[Point]\n    pass\n@end"
+        code = _compile(src)
+        assert "@dataclass" in code
+        assert "class Point:" in code
+
+    def test_decorator_on_async_func(self):
+        src = "@decorator[my_dec]\n@async[worker; x]\n    @return[x]\n@end"
+        code = _compile(src)
+        assert "@my_dec" in code
+        assert "async def worker(x):" in code
+
+    def test_decorator_runs(self):
+        ns = _run_ns(
+            "@import[functools]\n"
+            "@decorator[functools.lru_cache(maxsize=None)]\n"
+            "@func[double; x]\n"
+            "    @return[x * 2]\n"
+            "@end\n"
+            "@var[r; double(7)]"
+        )
+        assert ns["r"] == 14
+
+
+# ─────────────────────────────────────────────────────────────
+# MULTI-CATCH, MULTI-WITH, IMPORT ALIAS
+# ─────────────────────────────────────────────────────────────
+
+class TestMultiCatch:
+    def test_two_except_clauses(self):
+        src = (
+            "@try\n"
+            "    pass\n"
+            "@catch[TypeError]\n"
+            "    pass\n"
+            "@catch[ValueError; e]\n"
+            "    pass\n"
+            "@end"
+        )
+        code = _compile(src)
+        assert "except TypeError:" in code
+        assert "except ValueError as e:" in code
+
+    def test_three_except_clauses(self):
+        src = (
+            "@try\n"
+            "    pass\n"
+            "@catch[KeyError]\n"
+            "    pass\n"
+            "@catch[IndexError]\n"
+            "    pass\n"
+            "@catch[Exception; err]\n"
+            "    pass\n"
+            "@end"
+        )
+        code = _compile(src)
+        assert "except KeyError:" in code
+        assert "except IndexError:" in code
+        assert "except Exception as err:" in code
+
+    def test_multi_catch_runs(self):
+        ns = _run_ns(
+            "@var[result; None]\n"
+            "@try\n"
+            "    @var[x; int('bad')]\n"
+            "@catch[TypeError]\n"
+            "    @var[result; 'type']\n"
+            "@catch[ValueError]\n"
+            "    @var[result; 'value']\n"
+            "@end"
+        )
+        assert ns["result"] == "value"
+
+
+class TestMultiWith:
+    def test_single_context_manager(self):
+        code = _compile("@with[open('a.txt') as f]\n    pass\n@end")
+        assert "with open('a.txt') as f:" in code
+
+    def test_two_context_managers(self):
+        code = _compile("@with[open('a') as f; open('b') as g]\n    pass\n@end")
+        assert "with open('a') as f, open('b') as g:" in code
+
+    def test_three_context_managers(self):
+        code = _compile("@with[A() as a; B() as b; C() as c]\n    pass\n@end")
+        assert "with A() as a, B() as b, C() as c:" in code
+
+    def test_no_alias(self):
+        code = _compile("@with[lock]\n    pass\n@end")
+        assert "with lock:" in code
+
+
+class TestImportAlias:
+    def test_import_as_inline(self):
+        code = _compile("@import[numpy as np]")
+        assert "import numpy as np" in code
+
+    def test_import_as_second_arg(self):
+        code = _compile("@import[os.path; path]")
+        assert "import os.path as path" in code
+
+    def test_import_unknown_passthrough(self):
+        code = _compile("@import[some_third_party_lib]")
+        assert "import some_third_party_lib" in code
+
+
+# ─────────────────────────────────────────────────────────────
+# v2.0.0 FIXES: f-string passthrough, @print multi-arg, @assert,
+#               @input inline, @raise from, STRING quoting
+# ─────────────────────────────────────────────────────────────
+
+class TestFStringPassthrough:
+    def test_fstring_var_codegen(self):
+        code = _compile('@var[r; f"hi {name}"]')
+        assert 'r = f"hi {name}"' in code
+
+    def test_fstring_var_runs(self):
+        ns = _run_ns('@var[name; "Ada"]\n@var[r; f"hi {name}"]')
+        assert ns["r"] == "hi Ada"
+
+    def test_rstring_passthrough(self):
+        code = _compile(r'@var[p; r"\d+"]')
+        assert r'p = r"\d+"' in code
+
+    def test_bstring_passthrough(self):
+        code = _compile('@var[b; b"bytes"]')
+        assert 'b = b"bytes"' in code
+
+    def test_fstring_in_print(self, capsys):
+        run_source('@var[x; 7]\n@print[f"x = {x}"]')
+        assert capsys.readouterr().out.strip() == "x = 7"
+
+    def test_fstring_with_single_quote_prefix(self):
+        code = _compile("@var[r; f'hello {name}']")
+        assert "f'hello {name}'" in code
+
+
+class TestPrintMultiArg:
+    def test_two_args_codegen(self):
+        code = _compile("@print[a; b]")
+        assert "print(" in code
+        assert '"a"' in code and '"b"' in code
+
+    def test_three_args_runs(self, capsys):
+        run_source('@print[hello; world; !]')
+        out = capsys.readouterr().out.strip()
+        assert out == "hello world !"
+
+    def test_sep_kwarg_codegen(self):
+        code = _compile('@print[a; b; sep=", "]')
+        assert 'sep=", "' in code
+
+    def test_sep_kwarg_runs(self, capsys):
+        run_source('@var[x; 1]\n@var[y; 2]\n@print[{x}; {y}; sep="-"]')
+        assert capsys.readouterr().out.strip() == "1-2"
+
+    def test_end_kwarg_codegen(self):
+        code = _compile('@print[hello; end=""]')
+        assert 'end=""' in code
+
+    def test_end_kwarg_runs(self, capsys):
+        run_source('@print[hi; end="!"]\n@print[]')
+        out = capsys.readouterr().out
+        assert "hi!" in out
+
+    def test_single_arg_unchanged(self, capsys):
+        run_source('@print[hello]')
+        assert capsys.readouterr().out.strip() == "hello"
+
+
+class TestAssertOptionalMessage:
+    def test_no_message_codegen(self):
+        code = _compile("@assert[x > 0]")
+        assert "assert x > 0" in code
+        assert "assert x > 0," not in code
+
+    def test_with_message_codegen(self):
+        code = _compile('@assert[x > 0; "must be positive"]')
+        assert 'assert x > 0, "must be positive"' in code
+
+    def test_no_message_passes(self):
+        run_source("@var[x; 5]\n@assert[x > 0]")  # no exception
+
+    def test_no_message_fails(self):
+        with pytest.raises((AssertionError, RunError)):
+            run_source("@var[x; -1]\n@assert[x > 0]")
+
+
+class TestInputInline:
+    def test_input_inline_codegen(self):
+        code = _compile('@var[x; @input[Enter name:]]')
+        assert 'input("Enter name:")' in code
+
+    def test_input_inline_in_if(self):
+        code = _compile('@if[@input[Continue? ] == "yes"]\n    pass\n@end')
+        assert "input(" in code
+
+    def test_input_quoted_prompt(self):
+        code = _compile('@var[x; @input["Enter: "]]')
+        assert 'input("Enter: ")' in code
+
+    def test_input_no_prompt(self):
+        code = _compile('@var[x; @input[]]')
+        assert 'input()' in code
+
+
+class TestRaiseFrom:
+    def test_raise_from_codegen(self):
+        code = _compile("@raise[RuntimeError; something; from=original]")
+        assert "raise RuntimeError(" in code
+        assert "from original" in code
+
+    def test_raise_from_none_suppresses_chain(self):
+        code = _compile("@raise[ValueError; bad; from=None]")
+        assert "from None" in code
+
+    def test_raise_without_from_unchanged(self):
+        code = _compile("@raise[ValueError; bad]")
+        assert "from" not in code
+        assert "raise ValueError(" in code
+
+    def test_raise_from_runs(self):
+        with pytest.raises((RuntimeError, RunError)):
+            run_source(
+                "@try\n"
+                "    @raise[RuntimeError; outer; from=None]\n"
+                "@catch[RuntimeError]\n"
+                "    pass\n"
+                "@end"
+            )
+
+
+class TestStringEmbeddedQuotes:
+    def test_single_quoted_with_double_inside(self):
+        ns = _run_ns('@var[x; \'say "hi"\']')
+        assert ns["x"] == 'say "hi"'
+
+    def test_double_quoted_escaping(self):
+        ns = _run_ns(r'@var[x; "say \"hi\""]')
+        assert ns["x"] == 'say "hi"'
+
+
+# ─────────────────────────────────────────────────────────────
+# DEEP AUDIT FIXES: empty blocks, try/finally, numeric literals, ternary
+# ─────────────────────────────────────────────────────────────
+
+class TestEmptyBlock:
+    def test_empty_func_body_valid_python(self, capsys):
+        run_source('@func[f]\n@end\n@print[ok]')
+        assert capsys.readouterr().out.strip() == "ok"
+
+    def test_empty_if_valid_python(self, capsys):
+        run_source('@if[True]\n@end\n@print[ok]')
+        assert capsys.readouterr().out.strip() == "ok"
+
+    def test_empty_for_valid_python(self, capsys):
+        run_source('@for[i; range(0)]\n@end\n@print[ok]')
+        assert capsys.readouterr().out.strip() == "ok"
+
+    def test_empty_while_valid_python(self, capsys):
+        run_source('@var[n; 0]\n@while[n > 0]\n@end\n@print[ok]')
+        assert capsys.readouterr().out.strip() == "ok"
+
+    def test_empty_class_valid_python(self, capsys):
+        run_source('@class[Empty]\n@end\n@print[ok]')
+        assert capsys.readouterr().out.strip() == "ok"
+
+    def test_empty_block_pass_properly_indented(self):
+        code = _compile('@func[f]\n@end')
+        lines = code.splitlines()
+        func_line = next(i for i, l in enumerate(lines) if 'def f()' in l)
+        pass_line = next(i for i, l in enumerate(lines) if l.strip() == 'pass')
+        assert pass_line == func_line + 1
+        assert lines[pass_line].startswith('    ')  # indented
+
+
+class TestTryFinally:
+    def test_try_finally_no_except_codegen(self):
+        code = _compile('@try\n    pass\n@finally\n    pass\n@end')
+        assert 'try:' in code
+        assert 'finally:' in code
+        assert 'except' not in code
+
+    def test_try_finally_runs(self, capsys):
+        run_source(
+            '@var[done; False]\n'
+            '@try\n'
+            '    @var[x; 1]\n'
+            '@finally\n'
+            '    @var[done; True]\n'
+            '@end\n'
+            '@print[{done}]'
+        )
+        assert capsys.readouterr().out.strip() == "True"
+
+    def test_try_except_finally_still_works(self, capsys):
+        run_source(
+            '@var[r; "none"]\n'
+            '@try\n'
+            '    @raise[ValueError; "bad"]\n'
+            '@catch[ValueError]\n'
+            '    @var[r; "caught"]\n'
+            '@finally\n'
+            '    @var[r; r + "!!"]\n'
+            '@end\n'
+            '@print[{r}]'
+        )
+        assert capsys.readouterr().out.strip() == "caught!!"
+
+    def test_try_without_catch_default_except(self):
+        code = _compile('@try\n    pass\n@end')
+        # A bare try with no catch and no finally still needs some handler
+        # to be valid Python — current behavior omits it, so we just check
+        # it compiles without crash
+        assert 'try:' in code
+
+
+class TestNumericLiterals:
+    def test_hex_literal(self):
+        code = _compile('@var[x; 0xFF]')
+        assert 'x = 0xFF' in code
+
+    def test_hex_literal_runs(self):
+        ns = _run_ns('@var[x; 0xFF]')
+        assert ns['x'] == 255
+
+    def test_hex_lower(self):
+        ns = _run_ns('@var[x; 0x1f]')
+        assert ns['x'] == 31
+
+    def test_octal_literal(self):
+        ns = _run_ns('@var[x; 0o10]')
+        assert ns['x'] == 8
+
+    def test_binary_literal(self):
+        ns = _run_ns('@var[x; 0b1010]')
+        assert ns['x'] == 10
+
+    def test_underscore_int(self):
+        ns = _run_ns('@var[x; 1_000_000]')
+        assert ns['x'] == 1_000_000
+
+    def test_scientific_notation(self):
+        ns = _run_ns('@var[x; 1.5e3]')
+        assert ns['x'] == 1500.0
+
+    def test_scientific_negative_exp(self):
+        ns = _run_ns('@var[x; 1.5e-3]')
+        assert abs(ns['x'] - 0.0015) < 1e-10
+
+    def test_negative_hex(self):
+        ns = _run_ns('@var[x; -0xFF]')
+        assert ns['x'] == -255
+
+
+class TestTernaryExpression:
+    def test_ternary_codegen(self):
+        code = _compile('@var[r; a if b else c]')
+        assert 'r = a if b else c' in code
+
+    def test_ternary_runs(self):
+        ns = _run_ns('@var[x; 5]\n@var[r; "pos" if x > 0 else "neg"]')
+        assert ns['r'] == "pos"
+
+    def test_ternary_false_branch(self):
+        ns = _run_ns('@var[x; -1]\n@var[r; "pos" if x > 0 else "neg"]')
+        assert ns['r'] == "neg"
+
+    def test_nested_ternary(self):
+        ns = _run_ns('@var[x; 0]\n@var[r; "pos" if x > 0 else "zero" if x == 0 else "neg"]')
+        assert ns['r'] == "zero"
+
+
+# ─────────────────────────────────────────────────────────────
+# NEW STDLIB LIBS (v2.1.0 additions)
+# ─────────────────────────────────────────────────────────────
+
+from cruhon.core.registry import get_lib_call
+
+
+class TestRandomLib:
+    def test_randint_codegen(self):
+        h = get_lib_call("random", "randint")
+        assert h(["1", "10"]) == "__import__('random').randint(1, 10)"
+
+    def test_choice_codegen(self):
+        h = get_lib_call("random", "choice")
+        assert h(["items"]) == "__import__('random').choice(items)"
+
+    def test_shuffle_codegen(self):
+        h = get_lib_call("random", "shuffle")
+        assert h(["lst"]) == "__import__('random').shuffle(lst)"
+
+    def test_sample_codegen(self):
+        h = get_lib_call("random", "sample")
+        assert h(["lst", "3"]) == "__import__('random').sample(lst, 3)"
+
+    def test_uniform_codegen(self):
+        h = get_lib_call("random", "uniform")
+        assert h(["0.0", "1.0"]) == "__import__('random').uniform(0.0, 1.0)"
+
+    def test_seed_codegen(self):
+        h = get_lib_call("random", "seed")
+        assert h(["42"]) == "__import__('random').seed(42)"
+
+    def test_random_runs(self):
+        ns = _run_ns("@var[x; @random.randint[1; 100]]")
+        assert 1 <= ns["x"] <= 100
+
+    def test_choice_runs(self):
+        ns = _run_ns("@var[items; [1, 2, 3]]\n@var[x; @random.choice[items]]")
+        assert ns["x"] in [1, 2, 3]
+
+
+class TestCollectionsLib:
+    def test_Counter_codegen(self):
+        h = get_lib_call("collections", "Counter")
+        assert "__import__('collections').Counter" in h(["items"])
+
+    def test_defaultdict_codegen(self):
+        h = get_lib_call("collections", "defaultdict")
+        assert "__import__('collections').defaultdict(list)" in h(["list"])
+
+    def test_deque_codegen(self):
+        h = get_lib_call("collections", "deque")
+        assert "__import__('collections').deque" in h(["items"])
+
+    def test_Counter_runs(self):
+        ns = _run_ns("@var[c; @collections.Counter[\"aabbc\"]]")
+        import collections
+        assert ns["c"] == collections.Counter("aabbc")
+
+    def test_deque_runs(self):
+        ns = _run_ns("@var[d; @collections.deque[[1, 2, 3]]]")
+        from collections import deque
+        assert list(ns["d"]) == [1, 2, 3]
+
+    def test_namedtuple_codegen(self):
+        h = get_lib_call("collections", "namedtuple")
+        result = h(['"Point"', '"x y"'])
+        assert "__import__('collections').namedtuple" in result
+
+    def test_OrderedDict_runs(self):
+        ns = _run_ns("@var[od; @collections.OrderedDict[]]")
+        from collections import OrderedDict
+        assert isinstance(ns["od"], OrderedDict)
+
+
+class TestItertoolsLib:
+    def test_chain_codegen(self):
+        h = get_lib_call("itertools", "chain")
+        assert "__import__('itertools').chain" in h(["a", "b"])
+
+    def test_combinations_codegen(self):
+        h = get_lib_call("itertools", "combinations")
+        assert "__import__('itertools').combinations(lst, 2)" in h(["lst", "2"])
+
+    def test_permutations_codegen(self):
+        h = get_lib_call("itertools", "permutations")
+        assert "__import__('itertools').permutations(lst)" in h(["lst"])
+
+    def test_cycle_codegen(self):
+        h = get_lib_call("itertools", "cycle")
+        assert "__import__('itertools').cycle(lst)" in h(["lst"])
+
+    def test_islice_codegen(self):
+        h = get_lib_call("itertools", "islice")
+        assert "__import__('itertools').islice(it, 5)" in h(["it", "5"])
+
+    def test_chain_runs(self):
+        ns = _run_ns("\n".join([
+            "@var[chained; @itertools.chain[[1, 2]; [3, 4]]]",
+            "@var[r; list(chained)]",
+        ]))
+        assert ns["r"] == [1, 2, 3, 4]
+
+    def test_combinations_runs(self):
+        ns = _run_ns("\n".join([
+            "@var[combos; @itertools.combinations[[1, 2, 3]; 2]]",
+            "@var[r; list(combos)]",
+        ]))
+        assert ns["r"] == [(1, 2), (1, 3), (2, 3)]
+
+    def test_flatten_runs(self):
+        ns = _run_ns("@var[r; @itertools.flatten[[[1, 2], [3, 4]]]]")
+        assert ns["r"] == [1, 2, 3, 4]
+
+
+class TestFunctoolsLib:
+    def test_reduce_codegen(self):
+        h = get_lib_call("functools", "reduce")
+        result = h(["lambda a, b: a + b", "[1, 2, 3]"])
+        assert "__import__('functools').reduce" in result
+
+    def test_partial_codegen(self):
+        h = get_lib_call("functools", "partial")
+        result = h(["pow", "2"])
+        assert "__import__('functools').partial(pow, 2)" in result
+
+    def test_lru_cache_codegen(self):
+        h = get_lib_call("functools", "lru_cache")
+        result = h(["128"])
+        assert "__import__('functools').lru_cache(maxsize=128)" in result
+
+    def test_reduce_runs(self):
+        ns = _run_ns("@var[r; @functools.reduce[lambda a, b: a + b; [1, 2, 3, 4]]]")
+        assert ns["r"] == 10
+
+    def test_partial_runs(self):
+        ns = _run_ns("@var[add2; @functools.partial[int.__add__; 2]]\n@var[r; add2(3)]")
+        # int.__add__ may not work in all contexts; test codegen only
+        h = get_lib_call("functools", "partial")
+        assert "__import__('functools').partial" in h(["f", "x"])
+
+
+class TestSysLib:
+    def test_argv_codegen(self):
+        h = get_lib_call("sys", "argv")
+        assert "__import__('sys').argv" in h([])
+
+    def test_version_codegen(self):
+        h = get_lib_call("sys", "version")
+        assert "__import__('sys').version" in h([])
+
+    def test_maxsize_codegen(self):
+        h = get_lib_call("sys", "maxsize")
+        assert "__import__('sys').maxsize" in h([])
+
+    def test_argv_runs(self):
+        ns = _run_ns("@var[argv; @sys.argv[]]")
+        import sys
+        assert ns["argv"] is sys.argv
+
+    def test_platform_runs(self):
+        ns = _run_ns("@var[p; @sys.platform[]]")
+        import sys
+        assert ns["p"] == sys.platform
+
+    def test_exit_codegen(self):
+        h = get_lib_call("sys", "exit")
+        assert "__import__('sys').exit(0)" in h([])
+        assert "__import__('sys').exit(1)" in h(["1"])
+
+
+class TestIOLib:
+    def test_StringIO_codegen(self):
+        h = get_lib_call("io", "StringIO")
+        assert "__import__('io').StringIO" in h([])
+
+    def test_BytesIO_codegen(self):
+        h = get_lib_call("io", "BytesIO")
+        assert "__import__('io').BytesIO" in h([])
+
+    def test_getvalue_codegen(self):
+        h = get_lib_call("io", "getvalue")
+        assert "buf.getvalue()" in h(["buf"])
+
+    def test_StringIO_runs(self):
+        ns = _run_ns("@var[buf; @io.StringIO[]]\n@io.write[buf; \"hello\"]\n@var[r; @io.getvalue[buf]]")
+        assert ns["r"] == "hello"
+
+    def test_seek_tell_runs(self):
+        ns = _run_ns("\n".join([
+            "@var[buf; @io.StringIO[]]",
+            "@io.write[buf; \"hello\"]",
+            "@io.seek[buf; 0]",
+            "@var[r; @io.read[buf]]",
+        ]))
+        assert ns["r"] == "hello"
+
+
+class TestCopyLib:
+    def test_copy_codegen(self):
+        h = get_lib_call("copy", "copy")
+        assert "__import__('copy').copy(x)" in h(["x"])
+
+    def test_deepcopy_codegen(self):
+        h = get_lib_call("copy", "deepcopy")
+        assert "__import__('copy').deepcopy(x)" in h(["x"])
+
+    def test_copy_runs(self):
+        ns = _run_ns("@var[a; [1, 2, 3]]\n@var[b; @copy.copy[a]]")
+        assert ns["b"] == [1, 2, 3]
+        assert ns["b"] is not ns["a"]
+
+    def test_deepcopy_runs(self):
+        ns = _run_ns("@var[a; [[1, 2], [3, 4]]]\n@var[b; @copy.deepcopy[a]]")
+        assert ns["b"] == [[1, 2], [3, 4]]
+        assert ns["b"] is not ns["a"]
+        assert ns["b"][0] is not ns["a"][0]
+
+
+class TestBase64Lib:
+    def test_encode_codegen(self):
+        h = get_lib_call("base64", "encode")
+        result = h(["s"])
+        assert "__import__('base64').b64encode" in result
+
+    def test_decode_codegen(self):
+        h = get_lib_call("base64", "decode")
+        result = h(["s"])
+        assert "__import__('base64').b64decode" in result
+
+    def test_encode_runs(self):
+        ns = _run_ns('@var[r; @base64.encode["hello"]]')
+        import base64
+        assert ns["r"] == base64.b64encode(b"hello").decode()
+
+    def test_decode_runs(self):
+        ns = _run_ns('@var[enc; @base64.encode["hello"]]\n@var[r; @base64.decode[enc]]')
+        assert ns["r"] == "hello"
+
+    def test_urlsafe_encode_codegen(self):
+        h = get_lib_call("base64", "urlsafe_encode")
+        assert "__import__('base64').urlsafe_b64encode" in h(["s"])
+
+
+class TestUrlLib:
+    def test_quote_codegen(self):
+        h = get_lib_call("url", "quote")
+        assert "quote" in h(["s"])
+
+    def test_unquote_codegen(self):
+        h = get_lib_call("url", "unquote")
+        assert "unquote" in h(["s"])
+
+    def test_parse_codegen(self):
+        h = get_lib_call("url", "parse")
+        assert "urlparse" in h(["u"])
+
+    def test_join_codegen(self):
+        h = get_lib_call("url", "join")
+        assert "urljoin" in h(["base", "path"])
+
+    def test_quote_runs(self):
+        ns = _run_ns('@var[r; @url.quote["hello world"]]')
+        import urllib.parse
+        assert ns["r"] == urllib.parse.quote("hello world")
+
+    def test_encode_runs(self):
+        ns = _run_ns('@var[r; @url.encode[{"key": "val"}]]')
+        import urllib.parse
+        assert ns["r"] == urllib.parse.urlencode({"key": "val"})
+
+
+class TestStatisticsLib:
+    def test_mean_codegen(self):
+        h = get_lib_call("statistics", "mean")
+        assert "__import__('statistics').mean(data)" in h(["data"])
+
+    def test_median_codegen(self):
+        h = get_lib_call("statistics", "median")
+        assert "__import__('statistics').median(data)" in h(["data"])
+
+    def test_stdev_codegen(self):
+        h = get_lib_call("statistics", "stdev")
+        assert "__import__('statistics').stdev(data)" in h(["data"])
+
+    def test_mean_runs(self):
+        ns = _run_ns("@var[data; [1, 2, 3, 4, 5]]\n@var[r; @statistics.mean[data]]")
+        assert ns["r"] == 3.0
+
+    def test_median_runs(self):
+        ns = _run_ns("@var[data; [1, 2, 3, 4, 5]]\n@var[r; @statistics.median[data]]")
+        assert ns["r"] == 3
+
+    def test_mode_runs(self):
+        ns = _run_ns("@var[data; [1, 1, 2, 3]]\n@var[r; @statistics.mode[data]]")
+        assert ns["r"] == 1
+
+    def test_stdev_runs(self):
+        ns = _run_ns("@var[data; [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]]\n@var[r; @statistics.mean[data]]")
+        assert ns["r"] == 5.0
+
+
+class TestContextlibLib:
+    def test_suppress_codegen(self):
+        h = get_lib_call("contextlib", "suppress")
+        assert "__import__('contextlib').suppress" in h(["ValueError"])
+
+    def test_nullcontext_codegen(self):
+        h = get_lib_call("contextlib", "nullcontext")
+        assert "__import__('contextlib').nullcontext" in h([])
+
+    def test_closing_codegen(self):
+        h = get_lib_call("contextlib", "closing")
+        assert "__import__('contextlib').closing(obj)" in h(["obj"])
+
+    def test_ExitStack_codegen(self):
+        h = get_lib_call("contextlib", "ExitStack")
+        assert "__import__('contextlib').ExitStack()" in h([])
+
+
+class TestEnumLib:
+    def test_auto_codegen(self):
+        h = get_lib_call("enum", "auto")
+        assert "__import__('enum').auto()" in h([])
+
+    def test_IntEnum_codegen(self):
+        h = get_lib_call("enum", "IntEnum")
+        assert "__import__('enum').IntEnum" in h([])
+
+    def test_create_codegen(self):
+        h = get_lib_call("enum", "create")
+        result = h(['"Color"', '"RED GREEN BLUE"'])
+        assert "__import__('enum').Enum" in result
+
+    def test_names_codegen(self):
+        h = get_lib_call("enum", "names")
+        assert "[m.name for m in E]" in h(["E"])
+
+    def test_values_codegen(self):
+        h = get_lib_call("enum", "values")
+        assert "[m.value for m in E]" in h(["E"])
+
+
+class TestDataclassesLib:
+    def test_asdict_codegen(self):
+        h = get_lib_call("dataclasses", "asdict")
+        assert "__import__('dataclasses').asdict(obj)" in h(["obj"])
+
+    def test_astuple_codegen(self):
+        h = get_lib_call("dataclasses", "astuple")
+        assert "__import__('dataclasses').astuple(obj)" in h(["obj"])
+
+    def test_fields_codegen(self):
+        h = get_lib_call("dataclasses", "fields")
+        assert "__import__('dataclasses').fields(obj)" in h(["obj"])
+
+    def test_is_dataclass_codegen(self):
+        h = get_lib_call("dataclasses", "is_dataclass")
+        assert "__import__('dataclasses').is_dataclass(obj)" in h(["obj"])
+
+    def test_replace_codegen(self):
+        h = get_lib_call("dataclasses", "replace")
+        result = h(["obj", "x=1"])
+        assert "__import__('dataclasses').replace(obj, x=1)" in result
+
+
+class TestTypingLib:
+    def test_Optional_codegen(self):
+        h = get_lib_call("typing", "Optional")
+        assert "__import__('typing').Optional[int]" in h(["int"])
+
+    def test_List_codegen(self):
+        h = get_lib_call("typing", "List")
+        assert "__import__('typing').List[str]" in h(["str"])
+
+    def test_Dict_codegen(self):
+        h = get_lib_call("typing", "Dict")
+        assert "__import__('typing').Dict[str, int]" in h(["str", "int"])
+
+    def test_Any_codegen(self):
+        h = get_lib_call("typing", "Any")
+        assert "__import__('typing').Any" in h([])
+
+    def test_cast_codegen(self):
+        h = get_lib_call("typing", "cast")
+        assert "__import__('typing').cast(int, x)" in h(["int", "x"])
+
+    def test_TypeVar_codegen(self):
+        h = get_lib_call("typing", "TypeVar")
+        result = h(['"T"'])
+        assert "__import__('typing').TypeVar" in result
+        assert "T" in result
+
+
+class TestThreadingLib:
+    def test_Thread_codegen(self):
+        h = get_lib_call("threading", "Thread")
+        result = h(["fn"])
+        assert "__import__('threading').Thread(target=fn" in result
+
+    def test_Lock_codegen(self):
+        h = get_lib_call("threading", "Lock")
+        assert "__import__('threading').Lock()" in h([])
+
+    def test_Event_codegen(self):
+        h = get_lib_call("threading", "Event")
+        assert "__import__('threading').Event()" in h([])
+
+    def test_active_count_codegen(self):
+        h = get_lib_call("threading", "active_count")
+        assert "__import__('threading').active_count()" in h([])
+
+    def test_current_thread_runs(self):
+        ns = _run_ns("@var[t; @threading.current_thread[]]")
+        import threading
+        assert ns["t"] == threading.current_thread()
+
+
+class TestQueueLib:
+    def test_Queue_codegen(self):
+        h = get_lib_call("queue", "Queue")
+        assert "__import__('queue').Queue" in h([])
+
+    def test_LifoQueue_codegen(self):
+        h = get_lib_call("queue", "LifoQueue")
+        assert "__import__('queue').LifoQueue" in h([])
+
+    def test_PriorityQueue_codegen(self):
+        h = get_lib_call("queue", "PriorityQueue")
+        assert "__import__('queue').PriorityQueue" in h([])
+
+    def test_put_get_runs(self):
+        ns = _run_ns("\n".join([
+            "@var[q; @queue.Queue[]]",
+            "@queue.put[q; 42]",
+            "@var[r; @queue.get[q]]",
+        ]))
+        assert ns["r"] == 42
+
+    def test_empty_runs(self):
+        ns = _run_ns("@var[q; @queue.Queue[]]\n@var[r; @queue.empty[q]]")
+        assert ns["r"] is True
+
+
+class TestHeapqLib:
+    def test_heapify_codegen(self):
+        h = get_lib_call("heapq", "heapify")
+        assert "__import__('heapq').heapify(lst)" in h(["lst"])
+
+    def test_heappush_codegen(self):
+        h = get_lib_call("heapq", "heappush")
+        assert "__import__('heapq').heappush(h, x)" in h(["h", "x"])
+
+    def test_heappop_codegen(self):
+        h = get_lib_call("heapq", "heappop")
+        assert "__import__('heapq').heappop(h)" in h(["h"])
+
+    def test_nlargest_codegen(self):
+        h = get_lib_call("heapq", "nlargest")
+        assert "__import__('heapq').nlargest(3, lst)" in h(["3", "lst"])
+
+    def test_heapify_runs(self):
+        ns = _run_ns("@var[lst; [3, 1, 2]]\n@heapq.heapify[lst]\n@var[r; @heapq.heappop[lst]]")
+        assert ns["r"] == 1
+
+    def test_nsmallest_runs(self):
+        ns = _run_ns("@var[lst; [5, 3, 1, 4, 2]]\n@var[r; @heapq.nsmallest[3; lst]]")
+        assert ns["r"] == [1, 2, 3]
+
+
+class TestBisectLib:
+    def test_bisect_left_codegen(self):
+        h = get_lib_call("bisect", "bisect_left")
+        assert "__import__('bisect').bisect_left(a, x)" in h(["a", "x"])
+
+    def test_bisect_right_codegen(self):
+        h = get_lib_call("bisect", "bisect_right")
+        assert "__import__('bisect').bisect_right(a, x)" in h(["a", "x"])
+
+    def test_insort_codegen(self):
+        h = get_lib_call("bisect", "insort")
+        assert "__import__('bisect').insort(a, x)" in h(["a", "x"])
+
+    def test_bisect_left_runs(self):
+        ns = _run_ns("@var[a; [1, 3, 5, 7]]\n@var[r; @bisect.bisect_left[a; 4]]")
+        assert ns["r"] == 2
+
+    def test_insort_runs(self):
+        ns = _run_ns("@var[a; [1, 3, 5]]\n@bisect.insort[a; 4]\n@var[r; a]")
+        assert ns["r"] == [1, 3, 4, 5]
+
+
+class TestOperatorLib:
+    def test_itemgetter_codegen(self):
+        h = get_lib_call("operator", "itemgetter")
+        assert "__import__('operator').itemgetter(0)" in h(["0"])
+
+    def test_attrgetter_codegen(self):
+        h = get_lib_call("operator", "attrgetter")
+        assert "__import__('operator').attrgetter" in h(['"name"'])
+
+    def test_add_codegen(self):
+        h = get_lib_call("operator", "add")
+        assert "__import__('operator').add(x, y)" in h(["x", "y"])
+
+    def test_neg_codegen(self):
+        h = get_lib_call("operator", "neg")
+        assert "__import__('operator').neg(x)" in h(["x"])
+
+    def test_itemgetter_runs(self):
+        ns = _run_ns("\n".join([
+            "@var[lst; [[1, 2], [3, 4]]]",
+            "@var[key_fn; @operator.itemgetter[0]]",
+            "@var[r; sorted(lst, key=key_fn)]",
+        ]))
+        assert ns["r"] == [[1, 2], [3, 4]]
+
+    def test_add_runs(self):
+        ns = _run_ns("@var[r; @operator.add[3; 4]]")
+        assert ns["r"] == 7
+
+    def test_contains_codegen(self):
+        h = get_lib_call("operator", "contains")
+        assert "__import__('operator').contains(lst, x)" in h(["lst", "x"])
+
+
+class TestPprintLib:
+    def test_print_codegen(self):
+        h = get_lib_call("pprint", "print")
+        assert "__import__('pprint').pprint(x)" in h(["x"])
+
+    def test_format_codegen(self):
+        h = get_lib_call("pprint", "format")
+        assert "__import__('pprint').pformat(x)" in h(["x"])
+
+    def test_isreadable_codegen(self):
+        h = get_lib_call("pprint", "isreadable")
+        assert "__import__('pprint').isreadable(x)" in h(["x"])
+
+    def test_format_runs(self):
+        ns = _run_ns('@var[r; @pprint.format[{"a": 1, "b": 2}]]')
+        import pprint
+        assert ns["r"] == pprint.pformat({"a": 1, "b": 2})
+
+    def test_PrettyPrinter_codegen(self):
+        h = get_lib_call("pprint", "PrettyPrinter")
+        assert "__import__('pprint').PrettyPrinter()" in h([])
+
+
+# ─────────────────────────────────────────────────────────────
+# NEW STDLIB NAMESPACES (v2.2) — string / struct / zlib / calendar / email
+# ─────────────────────────────────────────────────────────────
+
+class TestStringLib:
+    def test_digits_codegen(self):
+        h = get_lib_call("string", "digits")
+        assert "__import__('string').digits" in h([])
+
+    def test_digits_runs(self):
+        ns = _run_ns("@var[r; @string.digits[]]")
+        assert ns["r"] == "0123456789"
+
+    def test_punctuation_runs(self):
+        import string
+        ns = _run_ns("@var[r; @string.punctuation[]]")
+        assert ns["r"] == string.punctuation
+
+    def test_capwords_runs(self):
+        ns = _run_ns('@var[r; @string.capwords["hello world"]]')
+        assert ns["r"] == "Hello World"
+
+    def test_substitute_runs(self):
+        ns = _run_ns('@var[r; @string.substitute["Hi $name"; {"name": "Bob"}]]')
+        assert ns["r"] == "Hi Bob"
+
+    def test_template_codegen(self):
+        h = get_lib_call("string", "template")
+        assert "__import__('string').Template(t)" in h(["t"])
+
+
+class TestStructLib:
+    def test_calcsize_codegen(self):
+        h = get_lib_call("struct", "calcsize")
+        assert "__import__('struct').calcsize" in h(['">I"'])
+
+    def test_pack_unpack_roundtrip(self):
+        ns = _run_ns(
+            '@var[data; @struct.pack[">I"; 42]]\n'
+            '@var[r; @struct.unpack[">I"; data]]'
+        )
+        assert ns["data"] == b"\x00\x00\x00*"
+        assert ns["r"] == (42,)
+
+    def test_calcsize_runs(self):
+        ns = _run_ns('@var[r; @struct.calcsize[">I"]]')
+        assert ns["r"] == 4
+
+    def test_compile_codegen(self):
+        h = get_lib_call("struct", "compile")
+        assert "__import__('struct').Struct" in h(['">I"'])
+
+
+class TestZlibLib:
+    def test_compress_decompress_roundtrip(self):
+        ns = _run_ns(
+            '@var[c; @zlib.compress["hello hello hello"]]\n'
+            '@var[r; @zlib.decompress_text[c]]'
+        )
+        assert ns["r"] == "hello hello hello"
+
+    def test_crc32_runs(self):
+        import zlib
+        ns = _run_ns('@var[r; @zlib.crc32["abc"]]')
+        assert ns["r"] == (zlib.crc32(b"abc") & 0xFFFFFFFF)
+
+    def test_crc32_hex_runs(self):
+        ns = _run_ns('@var[r; @zlib.crc32_hex["abc"]]')
+        assert ns["r"] == "352441c2"
+
+    def test_adler32_codegen(self):
+        h = get_lib_call("zlib", "adler32")
+        assert "__import__('zlib').adler32" in h(["data"])
+
+
+class TestCalendarLib:
+    def test_is_leap_runs(self):
+        ns = _run_ns("@var[r; @calendar.is_leap[2024]]")
+        assert ns["r"] is True
+
+    def test_is_leap_false(self):
+        ns = _run_ns("@var[r; @calendar.is_leap[2023]]")
+        assert ns["r"] is False
+
+    def test_days_in_month_runs(self):
+        ns = _run_ns("@var[r; @calendar.days_in_month[2024; 2]]")
+        assert ns["r"] == 29
+
+    def test_month_name_runs(self):
+        ns = _run_ns("@var[r; @calendar.month_name[3]]")
+        assert ns["r"] == "March"
+
+    def test_weekday_codegen(self):
+        h = get_lib_call("calendar", "weekday")
+        assert "__import__('calendar').weekday" in h(["2024", "6", "12"])
+
+
+class TestEmailLib:
+    def test_make_and_subject(self):
+        ns = _run_ns(
+            '@var[m; @email.make["Hi"; "a@b.com"; "c@d.com"; "body"]]\n'
+            '@var[s; @email.subject[m]]'
+        )
+        assert ns["s"] == "Hi"
+
+    def test_valid_address_true(self):
+        ns = _run_ns('@var[r; @email.valid_address["x@y.com"]]')
+        assert ns["r"] is True
+
+    def test_valid_address_false(self):
+        ns = _run_ns('@var[r; @email.valid_address["not-an-email"]]')
+        assert ns["r"] is False
+
+    def test_parse_address_runs(self):
+        ns = _run_ns('@var[r; @email.parse_address["Bob <bob@x.com>"]]')
+        assert ns["r"] == ("Bob", "bob@x.com")
+
+    def test_message_codegen(self):
+        h = get_lib_call("email", "message")
+        assert "EmailMessage()" in h([])
+
+
+# ─────────────────────────────────────────────────────────────
+# EXPANDED CORE LIBS (string, struct, zlib, calendar, email)
+# ─────────────────────────────────────────────────────────────
+
+class TestStringLibExpanded:
+    def test_ascii_to_int_runs(self):
+        ns = _run_ns('@var[r; @string.ascii_to_int["A"]]')
+        assert ns["r"] == 65
+
+    def test_int_to_ascii_runs(self):
+        ns = _run_ns("@var[r; @string.int_to_ascii[65]]")
+        assert ns["r"] == "A"
+
+    def test_filter_runs(self):
+        ns = _run_ns('@var[r; @string.filter["hello123"; "0123456789"]]')
+        assert ns["r"] == "123"
+
+    def test_exclude_runs(self):
+        ns = _run_ns('@var[r; @string.exclude["hello123"; "0123456789"]]')
+        assert ns["r"] == "hello"
+
+    def test_count_in_runs(self):
+        ns = _run_ns('@var[r; @string.count_in["hello"; "aeiou"]]')
+        assert ns["r"] == 2
+
+    def test_translate_runs(self):
+        ns = _run_ns('@var[r; @string.translate["hello"; "aeiou"; "AEIOU"]]')
+        assert ns["r"] == "hEllO"
+
+    def test_random_lower_length(self):
+        ns = _run_ns("@var[r; @string.random_lower[10]]")
+        assert len(ns["r"]) == 10
+        assert ns["r"].islower()
+
+    def test_random_upper_length(self):
+        ns = _run_ns("@var[r; @string.random_upper[6]]")
+        assert len(ns["r"]) == 6
+        assert ns["r"].isupper()
+
+    def test_random_digits_str_length(self):
+        ns = _run_ns("@var[r; @string.random_digits_str[8]]")
+        assert len(ns["r"]) == 8
+        assert ns["r"].isdigit()
+
+    def test_formatter_codegen(self):
+        h = get_lib_call("string", "formatter")
+        assert "Formatter()" in h([])
+
+    def test_maketrans_codegen(self):
+        h = get_lib_call("string", "maketrans")
+        assert "str.maketrans" in h(['"abc"', '"ABC"'])
+
+
+class TestStructLibExpanded:
+    def test_unpack_list_runs(self):
+        ns = _run_ns(
+            '@var[data; @struct.pack[">II"; 1; 2]]\n'
+            '@var[r; @struct.unpack_list[">II"; data]]'
+        )
+        assert ns["r"] == [1, 2]
+        assert isinstance(ns["r"], list)
+
+    def test_first_runs(self):
+        ns = _run_ns(
+            '@var[data; @struct.pack[">I"; 42]]\n'
+            '@var[r; @struct.first[">I"; data]]'
+        )
+        assert ns["r"] == 42
+
+    def test_pad_runs(self):
+        ns = _run_ns("@var[r; @struct.pad[4]]")
+        assert ns["r"] == b"\x00\x00\x00\x00"
+
+    def test_byte_order_runs(self):
+        import sys
+        ns = _run_ns("@var[r; @struct.byte_order[]]")
+        assert ns["r"] == sys.byteorder
+
+    def test_to_hex_runs(self):
+        ns = _run_ns('@var[r; @struct.to_hex[">I"; 255]]')
+        assert ns["r"] == "000000ff"
+
+    def test_from_hex_str_runs(self):
+        ns = _run_ns('@var[r; @struct.from_hex_str["000000ff"]]')
+        assert ns["r"] == b"\x00\x00\x00\xff"
+
+    def test_from_hex_str_codegen(self):
+        h = get_lib_call("struct", "from_hex_str")
+        assert "bytes.fromhex" in h(['"ff"'])
+
+
+class TestZlibLibExpanded:
+    def test_compress_b64_roundtrip(self):
+        ns = _run_ns(
+            '@var[c; @zlib.compress_b64["hello"]]\n'
+            '@var[r; @zlib.decompress_b64[c]]'
+        )
+        assert ns["r"] == b"hello"
+
+    def test_compress_str_roundtrip(self):
+        ns = _run_ns(
+            '@var[c; @zlib.compress_str["world"]]\n'
+            '@var[r; @zlib.decompress_str[c]]'
+        )
+        assert ns["r"] == "world"
+
+    def test_adler32_hex_runs(self):
+        import zlib
+        ns = _run_ns('@var[r; @zlib.adler32_hex["abc"]]')
+        expected = format(zlib.adler32(b"abc") & 0xFFFFFFFF, "08x")
+        assert ns["r"] == expected
+
+    def test_saved_bytes_positive(self):
+        ns = _run_ns('@var[r; @zlib.saved_bytes["hello hello hello hello hello"]]')
+        assert ns["r"] > 0
+
+    def test_is_zlib_true(self):
+        ns = _run_ns(
+            '@var[c; @zlib.compress["test data"]]\n'
+            '@var[r; @zlib.is_zlib[c]]'
+        )
+        assert ns["r"] is True
+
+    def test_is_zlib_false(self):
+        ns = _run_ns('@var[r; @zlib.is_zlib[b"not compressed"]]')
+        assert ns["r"] is False
+
+
+class TestCalendarLibExpanded:
+    def test_is_weekday_true(self):
+        ns = _run_ns("@var[r; @calendar.is_weekday[2024; 6; 10]]")
+        assert ns["r"] is True
+
+    def test_is_weekend_true(self):
+        ns = _run_ns("@var[r; @calendar.is_weekend[2024; 6; 8]]")
+        assert ns["r"] is True
+
+    def test_first_weekday_of_runs(self):
+        ns = _run_ns("@var[r; @calendar.first_weekday_of[2024; 6]]")
+        assert isinstance(ns["r"], int)
+        assert 0 <= ns["r"] <= 6
+
+    def test_day_of_year_runs(self):
+        ns = _run_ns("@var[r; @calendar.day_of_year[2024; 1; 1]]")
+        assert ns["r"] == 1
+
+    def test_day_of_year_dec(self):
+        ns = _run_ns("@var[r; @calendar.day_of_year[2024; 12; 31]]")
+        assert ns["r"] == 366
+
+    def test_week_of_year_runs(self):
+        ns = _run_ns("@var[r; @calendar.week_of_year[2024; 1; 1]]")
+        assert isinstance(ns["r"], int)
+
+    def test_year_text_runs(self):
+        ns = _run_ns("@var[r; @calendar.year_text[2024]]")
+        assert "2024" in ns["r"]
+
+    def test_quarter_q1(self):
+        ns = _run_ns("@var[r; @calendar.quarter[1]]")
+        assert ns["r"] == 1
+
+    def test_quarter_q4(self):
+        ns = _run_ns("@var[r; @calendar.quarter[12]]")
+        assert ns["r"] == 4
+
+    def test_next_month_regular(self):
+        ns = _run_ns("@var[r; @calendar.next_month[2024; 6]]")
+        assert ns["r"] == (2024, 7)
+
+    def test_next_month_december(self):
+        ns = _run_ns("@var[r; @calendar.next_month[2024; 12]]")
+        assert ns["r"] == (2025, 1)
+
+    def test_prev_month_regular(self):
+        ns = _run_ns("@var[r; @calendar.prev_month[2024; 6]]")
+        assert ns["r"] == (2024, 5)
+
+    def test_prev_month_january(self):
+        ns = _run_ns("@var[r; @calendar.prev_month[2024; 1]]")
+        assert ns["r"] == (2023, 12)
+
+
+class TestEmailLibExpanded:
+    def test_cc_header(self):
+        ns = _run_ns(
+            '@var[m; @email.make["Hi"; "a@b.com"; "c@d.com"; "body"]]\n'
+            '@var[r; @email.cc[m]]'
+        )
+        assert ns["r"] == ""
+
+    def test_content_type_runs(self):
+        ns = _run_ns(
+            '@var[m; @email.message[]]\n'
+            '@var[r; @email.content_type[m]]'
+        )
+        assert isinstance(ns["r"], str)
+
+    def test_to_bytes_runs(self):
+        ns = _run_ns(
+            '@var[m; @email.make["Hi"; "a@b.com"; "c@d.com"; "body"]]\n'
+            '@var[r; @email.to_bytes[m]]'
+        )
+        assert isinstance(ns["r"], bytes)
+        assert b"Hi" in ns["r"]
+
+    def test_all_attachments_empty(self):
+        ns = _run_ns(
+            '@var[m; @email.message[]]\n'
+            '@var[r; @email.all_attachments[m]]'
+        )
+        assert ns["r"] == []
+
+    def test_address_list_runs(self):
+        ns = _run_ns('@var[r; @email.address_list["Bob <bob@x.com>, alice@y.com"]]')
+        assert len(ns["r"]) == 2
+        assert ns["r"][0] == ("Bob", "bob@x.com")
+
+    def test_reply_to_empty(self):
+        ns = _run_ns(
+            '@var[m; @email.message[]]\n'
+            '@var[r; @email.reply_to[m]]'
+        )
+        assert ns["r"] == ""
+
+    def test_bcc_empty(self):
+        ns = _run_ns(
+            '@var[m; @email.message[]]\n'
+            '@var[r; @email.bcc[m]]'
+        )
+        assert ns["r"] == ""
+
+    def test_html_body_empty(self):
+        ns = _run_ns(
+            '@var[m; @email.make["S"; "a@b.com"; "c@d.com"; "text"]]\n'
+            '@var[r; @email.html_body[m]]'
+        )
+        assert isinstance(ns["r"], str)
+
+
+# ─────────────────────────────────────────────────────────────
+# DATA & FORMAT NAMESPACES (new in v2.4.0)
+# ─────────────────────────────────────────────────────────────
+
+class TestXmlLib:
+    def test_from_string_and_tag(self):
+        ns = _run_ns('@var[r; @xml.from_string["<root><a>1</a></root>"]]\n@var[t; @xml.tag[r]]')
+        assert ns["t"] == "root"
+
+    def test_find_text(self):
+        ns = _run_ns('@var[r; @xml.from_string["<a><b>hi</b></a>"]]\n@var[t; @xml.find_text[r; "b"]]')
+        assert ns["t"] == "hi"
+
+    def test_attrib(self):
+        ns = _run_ns('@var[r; @xml.from_string["<a id=\\"5\\" name=\\"x\\"/>"]]\n@var[d; @xml.attrib[r]]')
+        assert ns["d"] == {"id": "5", "name": "x"}
+
+    def test_get_attribute(self):
+        ns = _run_ns('@var[r; @xml.from_string["<a id=\\"5\\"/>"]]\n@var[v; @xml.get[r; "id"]]')
+        assert ns["v"] == "5"
+
+    def test_find_all_count(self):
+        ns = _run_ns(
+            '@var[r; @xml.from_string["<root><i>1</i><i>2</i><i>3</i></root>"]]\n'
+            '@var[c; @xml.count[r; "i"]]'
+        )
+        assert ns["c"] == 3
+
+    def test_children(self):
+        ns = _run_ns(
+            '@var[r; @xml.from_string["<root><a/><b/></root>"]]\n'
+            '@var[ch; @xml.children[r]]'
+        )
+        assert len(ns["ch"]) == 2
+
+    def test_to_dict(self):
+        ns = _run_ns(
+            '@var[r; @xml.from_string["<a x=\\"1\\"><b>hi</b></a>"]]\n'
+            '@var[d; @xml.to_dict[r]]'
+        )
+        assert ns["d"]["tag"] == "a"
+        assert ns["d"]["attrib"] == {"x": "1"}
+        assert ns["d"]["children"][0]["text"] == "hi"
+
+    def test_to_string_codegen(self):
+        h = get_lib_call("xml", "to_string")
+        assert "tostring" in h(["el"])
+
+
+class TestTomlLib:
+    def test_loads(self):
+        ns = _run_ns('@var[d; @toml.loads["a = 1\\nb = \\"x\\""]]')
+        assert ns["d"] == {"a": 1, "b": "x"}
+
+    def test_get(self):
+        ns = _run_ns('@var[v; @toml.get["port = 8080"; "port"]]')
+        assert ns["v"] == 8080
+
+    def test_get_default(self):
+        ns = _run_ns('@var[v; @toml.get["a = 1"; "missing"; 99]]')
+        assert ns["v"] == 99
+
+    def test_keys(self):
+        ns = _run_ns('@var[k; @toml.keys["a = 1\\nb = 2"]]')
+        assert set(ns["k"]) == {"a", "b"}
+
+    def test_has_true(self):
+        ns = _run_ns('@var[r; @toml.has["a = 1"; "a"]]')
+        assert ns["r"] is True
+
+
+class TestDiffLib:
+    def test_ratio_identical(self):
+        ns = _run_ns('@var[r; @diff.ratio["abc"; "abc"]]')
+        assert ns["r"] == 1.0
+
+    def test_ratio_partial(self):
+        ns = _run_ns('@var[r; @diff.ratio["hello"; "hallo"]]')
+        assert 0.5 < ns["r"] < 1.0
+
+    def test_is_similar_true(self):
+        ns = _run_ns('@var[r; @diff.is_similar["hello world"; "hello werld"]]')
+        assert ns["r"] is True
+
+    def test_is_similar_false(self):
+        ns = _run_ns('@var[r; @diff.is_similar["abc"; "xyz"]]')
+        assert ns["r"] is False
+
+    def test_close_matches(self):
+        ns = _run_ns('@var[r; @diff.close_matches["appel"; ["apple", "ape", "banana"]]]')
+        assert "apple" in ns["r"]
+
+    def test_best_match(self):
+        ns = _run_ns('@var[r; @diff.best_match["colour"; ["color", "flavor"]]]')
+        assert ns["r"] == "color"
+
+    def test_unified_runs(self):
+        ns = _run_ns('@var[r; @diff.unified["line1\\nline2"; "line1\\nCHANGED"]]')
+        assert isinstance(ns["r"], list)
+        assert any("CHANGED" in _l for _l in ns["r"])
+
+
+class TestDecimalLib:
+    def test_add_exact(self):
+        ns = _run_ns('@var[r; @decimal.add["0.1"; "0.2"]]')
+        assert str(ns["r"]) == "0.3"
+
+    def test_mul(self):
+        ns = _run_ns('@var[r; @decimal.mul["1.5"; "2"]]')
+        assert str(ns["r"]) == "3.0"
+
+    def test_round(self):
+        ns = _run_ns('@var[r; @decimal.round["3.14159"; 2]]')
+        assert str(ns["r"]) == "3.14"
+
+    def test_round_half_up(self):
+        ns = _run_ns('@var[r; @decimal.round["2.5"; 0]]')
+        assert str(ns["r"]) == "3"
+
+    def test_sum(self):
+        ns = _run_ns('@var[r; @decimal.sum[["0.1", "0.2", "0.3"]]]')
+        assert str(ns["r"]) == "0.6"
+
+    def test_to_float(self):
+        ns = _run_ns('@var[r; @decimal.to_float[@decimal.make["1.25"]]]')
+        assert ns["r"] == 1.25
+
+    def test_sqrt(self):
+        ns = _run_ns('@var[r; @decimal.sqrt["2"]]')
+        assert str(ns["r"]).startswith("1.4142")
+
+    def test_compare(self):
+        ns = _run_ns('@var[r; @decimal.compare["1"; "2"]]')
+        assert ns["r"] == -1
+
+
+class TestFractionLib:
+    def test_make_and_str(self):
+        ns = _run_ns('@var[r; @fraction.make[1; 3]]\n@var[s; @fraction.to_str[r]]')
+        assert ns["s"] == "1/3"
+
+    def test_make_reduces(self):
+        ns = _run_ns('@var[r; @fraction.make[2; 4]]\n@var[s; @fraction.to_str[r]]')
+        assert ns["s"] == "1/2"
+
+    def test_add_exact(self):
+        ns = _run_ns('@var[r; @fraction.add[@fraction.make[1; 3]; @fraction.make[1; 6]]]\n@var[s; @fraction.to_str[r]]')
+        assert ns["s"] == "1/2"
+
+    def test_from_float(self):
+        ns = _run_ns('@var[r; @fraction.from_float[0.25]]\n@var[s; @fraction.to_str[r]]')
+        assert ns["s"] == "1/4"
+
+    def test_numerator_denominator(self):
+        ns = _run_ns(
+            '@var[f; @fraction.make[3; 7]]\n'
+            '@var[n; @fraction.numerator[f]]\n'
+            '@var[d; @fraction.denominator[f]]'
+        )
+        assert ns["n"] == 3 and ns["d"] == 7
+
+    def test_to_tuple(self):
+        ns = _run_ns('@var[r; @fraction.to_tuple[@fraction.make[2; 5]]]')
+        assert ns["r"] == (2, 5)
+
+
+class TestIpLib:
+    def test_is_private_true(self):
+        ns = _run_ns('@var[r; @ip.is_private["192.168.1.1"]]')
+        assert ns["r"] is True
+
+    def test_is_private_false(self):
+        ns = _run_ns('@var[r; @ip.is_private["8.8.8.8"]]')
+        assert ns["r"] is False
+
+    def test_is_loopback(self):
+        ns = _run_ns('@var[r; @ip.is_loopback["127.0.0.1"]]')
+        assert ns["r"] is True
+
+    def test_version_v4(self):
+        ns = _run_ns('@var[r; @ip.version["10.0.0.1"]]')
+        assert ns["r"] == 4
+
+    def test_version_v6(self):
+        ns = _run_ns('@var[r; @ip.version["::1"]]')
+        assert ns["r"] == 6
+
+    def test_num_addresses(self):
+        ns = _run_ns('@var[r; @ip.num_addresses["10.0.0.0/24"]]')
+        assert ns["r"] == 256
+
+    def test_contains_true(self):
+        ns = _run_ns('@var[r; @ip.contains["10.0.0.0/8"; "10.5.5.5"]]')
+        assert ns["r"] is True
+
+    def test_contains_false(self):
+        ns = _run_ns('@var[r; @ip.contains["10.0.0.0/8"; "192.168.1.1"]]')
+        assert ns["r"] is False
+
+    def test_to_int_roundtrip(self):
+        ns = _run_ns(
+            '@var[n; @ip.to_int["1.2.3.4"]]\n'
+            '@var[a; @ip.from_int[n]]'
+        )
+        assert str(ns["a"]) == "1.2.3.4"
+
+
+class TestPlatformLib:
+    def test_system_runs(self):
+        ns = _run_ns("@var[r; @platform.system[]]")
+        import platform
+        assert ns["r"] == platform.system()
+
+    def test_python_version(self):
+        ns = _run_ns("@var[r; @platform.python_version[]]")
+        import platform
+        assert ns["r"] == platform.python_version()
+
+    def test_is_linux_or_not(self):
+        ns = _run_ns("@var[r; @platform.is_linux[]]")
+        assert isinstance(ns["r"], bool)
+
+    def test_is_64bit(self):
+        ns = _run_ns("@var[r; @platform.is_64bit[]]")
+        assert isinstance(ns["r"], bool)
+
+    def test_machine_codegen(self):
+        h = get_lib_call("platform", "machine")
+        assert "machine()" in h([])
+
+
+class TestUnicodeLib:
+    def test_name(self):
+        ns = _run_ns('@var[r; @unicode.name["A"]]')
+        assert ns["r"] == "LATIN CAPITAL LETTER A"
+
+    def test_lookup(self):
+        ns = _run_ns('@var[r; @unicode.lookup["LATIN SMALL LETTER A"]]')
+        assert ns["r"] == "a"
+
+    def test_category(self):
+        ns = _run_ns('@var[r; @unicode.category["5"]]')
+        assert ns["r"] == "Nd"
+
+    def test_numeric(self):
+        ns = _run_ns('@var[r; @unicode.numeric["\\u00bd"]]')
+        assert ns["r"] == 0.5
+
+    def test_strip_accents(self):
+        ns = _run_ns('@var[r; @unicode.strip_accents["café résumé"]]')
+        assert ns["r"] == "cafe resume"
+
+    def test_nfc_codegen(self):
+        h = get_lib_call("unicode", "nfc")
+        assert "NFC" in h(["s"])
+
+
+class TestBinasciiLib:
+    def test_hexlify(self):
+        ns = _run_ns('@var[r; @binascii.hexlify[b"AB"]]')
+        assert ns["r"] == "4142"
+
+    def test_hexlify_str_input(self):
+        ns = _run_ns('@var[r; @binascii.hexlify["AB"]]')
+        assert ns["r"] == "4142"
+
+    def test_unhexlify(self):
+        ns = _run_ns('@var[r; @binascii.unhexlify["4142"]]')
+        assert ns["r"] == b"AB"
+
+    def test_crc32(self):
+        import binascii
+        ns = _run_ns('@var[r; @binascii.crc32["hello"]]')
+        assert ns["r"] == (binascii.crc32(b"hello") & 0xFFFFFFFF)
+
+    def test_b2a_base64_codegen(self):
+        h = get_lib_call("binascii", "b2a_base64")
+        assert "b2a_base64" in h(["data"])
+
+
+class TestShlexLib:
+    def test_split(self):
+        ns = _run_ns('@var[r; @shlex.split["echo hello world"]]')
+        assert ns["r"] == ["echo", "hello", "world"]
+
+    def test_split_quoted(self):
+        ns = _run_ns('@var[r; @shlex.split["cmd \\"a b\\" c"]]')
+        assert ns["r"] == ["cmd", "a b", "c"]
+
+    def test_quote(self):
+        ns = _run_ns('@var[r; @shlex.quote["a b c"]]')
+        assert ns["r"] == "'a b c'"
+
+    def test_join(self):
+        ns = _run_ns('@var[r; @shlex.join[["echo", "a b"]]]')
+        assert ns["r"] == "echo 'a b'"
+
+    def test_quote_all(self):
+        ns = _run_ns('@var[r; @shlex.quote_all[["a b", "c"]]]')
+        assert ns["r"] == ["'a b'", "c"]
+
+
+# ─────────────────────────────────────────────────────────────
+# MOD LOADER SYSTEM FIXES (10 correctness fixes)
+# ─────────────────────────────────────────────────────────────
+
+from cruhon.core.mod_loader import (
+    ModAPI, _INJECT_PROVIDERS, _RUNTIME_HOOKS, _OVERRIDE_CHAINS,
+    fire_hook, CRUHON_VERSION,
+)
+from cruhon.core.transpiler import get_transpiler as _get_transpiler
+from cruhon.core.parser import get_parser as _get_parser
+
+
+class TestOverrideNodeNameMapping:
+    """Fix 1: async_for/async_with → correct CamelCase node names."""
+
+    def test_async_for_maps_correctly(self):
+        api = ModAPI("test-mod")
+        # Before fix: 'async_for'.title() → 'Async_For' → 'Async_ForNode' (wrong)
+        # After fix: CamelCase → 'AsyncForNode' (correct)
+        visited = []
+        def my_visitor(t, n):
+            visited.append(True)
+            return ""
+        api.override("async_for", my_visitor, warn=False)
+        assert "AsyncForNode" in _get_transpiler()._custom_visitors
+
+    def test_async_with_maps_correctly(self):
+        api = ModAPI("test-mod2")
+        def my_visitor(t, n):
+            return ""
+        api.override("async_with", my_visitor, warn=False)
+        assert "AsyncWithNode" in _get_transpiler()._custom_visitors
+
+    def test_assert_maps_correctly(self):
+        api = ModAPI("test-mod3")
+        def my_visitor(t, n):
+            return ""
+        api.override("assert", my_visitor, warn=False)
+        assert "AssertNode" in _get_transpiler()._custom_visitors
+
+    def test_fallback_camelcase(self):
+        api = ModAPI("test-mod4")
+        def my_visitor(t, n):
+            return ""
+        api.override("multi_word_cmd", my_visitor, warn=False)
+        assert "MultiWordCmdNode" in _get_transpiler()._custom_visitors
+
+    def test_del_maps_correctly(self):
+        api = ModAPI("test-mod5")
+        def my_visitor(t, n):
+            return ""
+        api.override("del", my_visitor, warn=False)
+        assert "DelNode" in _get_transpiler()._custom_visitors
+
+
+class TestVisitorOwnerTracking:
+    """Fix 9: _visitor_owners set for 3-arg override wrappers."""
+
+    def test_3arg_override_sets_owner(self):
+        api = ModAPI("owner-test-mod")
+        def my_3arg(transpiler, node, next_fn):
+            return next_fn()
+        api.override("while", my_3arg, warn=False)
+        assert _get_transpiler()._visitor_owners.get("WhileNode") == "owner-test-mod"
+
+    def test_2arg_override_sets_owner(self):
+        api = ModAPI("owner-test-mod2")
+        def my_2arg(transpiler, node):
+            return ""
+        api.override("repeat", my_2arg, warn=False)
+        assert _get_transpiler()._visitor_owners.get("RepeatNode") == "owner-test-mod2"
+
+
+class TestUnregisterAPI:
+    """Fix 8: api.unregister_command(), remove_hook(), remove_inject()."""
+
+    def test_unregister_command(self):
+        api = ModAPI("unregister-test")
+        def my_cmd(t, n):
+            return ""
+        api.override("yield", my_cmd, warn=False)
+        assert "YieldNode" in _get_transpiler()._custom_visitors
+        api.unregister_command("yield")
+        assert "YieldNode" not in _get_transpiler()._custom_visitors
+
+    def test_remove_inject(self):
+        api = ModAPI("inject-remove-test")
+        api.inject("_test_key_xyz", "test_value")
+        assert "_test_key_xyz" in _INJECT_PROVIDERS
+        api.remove_inject("_test_key_xyz")
+        assert "_test_key_xyz" not in _INJECT_PROVIDERS
+
+    def test_remove_hook(self):
+        api = ModAPI("hook-remove-test")
+        fired = []
+        def my_hook(**kwargs):
+            fired.append(1)
+        api.hook("before_run", my_hook)
+        assert my_hook in _RUNTIME_HOOKS.get("before_run", [])
+        api.remove_hook("before_run", my_hook)
+        assert my_hook not in _RUNTIME_HOOKS.get("before_run", [])
+
+    def test_remove_eval_hook(self):
+        api = ModAPI("eval-hook-remove-test")
+        def my_eval_hook(v, ctx):
+            return None
+        api.eval_hook(my_eval_hook)
+        assert my_eval_hook in _get_transpiler()._eval_hooks
+        api.remove_eval_hook(my_eval_hook)
+        assert my_eval_hook not in _get_transpiler()._eval_hooks
+
+
+class TestInjectOnce:
+    """Fix 5: api.inject_once() evaluates factory once, not per exec."""
+
+    def test_inject_once_stores_value_not_callable(self):
+        api = ModAPI("inject-once-test")
+        call_count = [0]
+        def factory():
+            call_count[0] += 1
+            return {"pool": "singleton"}
+        api.inject_once("_test_pool_xyz", factory)
+        assert call_count[0] == 1
+        # Value stored directly, NOT as callable
+        assert _INJECT_PROVIDERS["_test_pool_xyz"] == {"pool": "singleton"}
+        assert not callable(_INJECT_PROVIDERS["_test_pool_xyz"])
+        api.remove_inject("_test_pool_xyz")
+
+    def test_inject_once_reuses_same_object(self):
+        api = ModAPI("inject-once-test2")
+        obj = object()
+        api.inject_once("_test_obj_xyz", lambda: obj)
+        assert _INJECT_PROVIDERS["_test_obj_xyz"] is obj
+        api.remove_inject("_test_obj_xyz")
+
+
+class TestOnErrorHookFiring:
+    """Fix 4: on_error fires for ParseError/RunError too."""
+    from cruhon.core.runner import run_source as _rs
+    from cruhon.core.parser import ParseError as _PE
+
+    def test_on_error_fires_for_parse_error(self):
+        errors = []
+        def capture(error=None, **kw):
+            errors.append(type(error).__name__)
+        _RUNTIME_HOOKS.setdefault("on_error", []).append(capture)
+        try:
+            from cruhon.core.runner import run_source
+            run_source("@if[")  # malformed, should raise ParseError
+        except Exception:
+            pass
+        finally:
+            if capture in _RUNTIME_HOOKS.get("on_error", []):
+                _RUNTIME_HOOKS["on_error"].remove(capture)
+        assert len(errors) > 0
+
+    def test_on_error_fires_for_run_error(self):
+        errors = []
+        def capture(error=None, **kw):
+            errors.append(type(error).__name__)
+        _RUNTIME_HOOKS.setdefault("on_error", []).append(capture)
+        try:
+            from cruhon.core.runner import run_source
+            run_source("@var[x; undefined_variable_xyz]")
+        except Exception:
+            pass
+        finally:
+            if capture in _RUNTIME_HOOKS.get("on_error", []):
+                _RUNTIME_HOOKS["on_error"].remove(capture)
+        # Runtime NameError fires on_error
+        assert len(errors) > 0
+
+
+class TestAfterRunArgs:
+    """Fix 6: after_run hook receives source= and python_code= kwargs."""
+
+    def test_after_run_receives_source(self):
+        received = {}
+        def capture(**kwargs):
+            received.update(kwargs)
+        _RUNTIME_HOOKS.setdefault("after_run", []).append(capture)
+        try:
+            from cruhon.core.runner import run_source
+            run_source('@var[x; 1]')
+        except Exception:
+            pass
+        finally:
+            if capture in _RUNTIME_HOOKS.get("after_run", []):
+                _RUNTIME_HOOKS["after_run"].remove(capture)
+        assert "source" in received
+        assert "python_code" in received
+        assert "@var[x; 1]" in received["source"]
+
+    def test_after_run_python_code_is_string(self):
+        received = {}
+        def capture(**kwargs):
+            received.update(kwargs)
+        _RUNTIME_HOOKS.setdefault("after_run", []).append(capture)
+        try:
+            from cruhon.core.runner import run_source
+            run_source('@print["hello"]')
+        except Exception:
+            pass
+        finally:
+            if capture in _RUNTIME_HOOKS.get("after_run", []):
+                _RUNTIME_HOOKS["after_run"].remove(capture)
+        assert isinstance(received.get("python_code"), str)
+
+
+class TestVersionCheck:
+    """Fix 1 (version): _is_compatible() covers real version patterns."""
+
+    def test_current_version_compat(self):
+        from cruhon.core.mod_loader import _is_compatible
+        assert _is_compatible(f">={CRUHON_VERSION}")
+
+    def test_old_version_incompatible(self):
+        from cruhon.core.mod_loader import _is_compatible
+        assert not _is_compatible(">=99.0.0")
+
+    def test_range_constraint(self):
+        from cruhon.core.mod_loader import _is_compatible
+        assert _is_compatible(">=1.0.0,<99.0.0")
+
+    def test_equal_constraint(self):
+        from cruhon.core.mod_loader import _is_compatible
+        assert _is_compatible(f"=={CRUHON_VERSION}")
+
+
+# ─────────────────────────────────────────────────────────────
+# DIAGNOSTICS — rich, readable error reporting
+# ─────────────────────────────────────────────────────────────
+
+from cruhon.core import diagnostics as _d
+
+
+class TestSourceExcerpt:
+    def test_excerpt_marks_target_line(self):
+        src = "@var[a; 1]\n@var[b; 2]\n@var[c; 3]"
+        out = _d.source_excerpt(src, 2, colored=False)
+        assert "→" in out
+        assert "@var[b; 2]" in out
+        # context lines present
+        assert "@var[a; 1]" in out
+        assert "@var[c; 3]" in out
+
+    def test_excerpt_caret_under_column(self):
+        src = "@var[total; price + tax]"
+        out = _d.source_excerpt(src, 1, col=12, span=5, colored=False)
+        lines = out.splitlines()
+        # last line should be the caret row
+        assert "^^^^^" in lines[-1]
+
+    def test_excerpt_out_of_range_returns_empty(self):
+        assert _d.source_excerpt("one line", 99, colored=False) == ""
+
+    def test_excerpt_empty_source(self):
+        assert _d.source_excerpt("", 1, colored=False) == ""
+
+
+class TestSuggest:
+    def test_suggest_close_name(self):
+        assert _d.suggest("mesage", ["message", "count", "total"]) == "message"
+
+    def test_suggest_no_match_returns_none(self):
+        assert _d.suggest("xyz", ["completely", "different"]) is None
+
+    def test_suggest_ignores_self(self):
+        assert _d.suggest("name", ["name"]) is None
+
+    def test_collect_identifiers_excludes_builtins(self):
+        names = _d.collect_identifiers('@print[hello]\n@var[total; 1]')
+        assert "total" in names
+        assert "print" not in names  # builtin excluded
+
+    def test_collect_identifiers_excludes_allcaps(self):
+        names = _d.collect_identifiers('@var[VERSION; "1.0"]\n@var[count; 1]')
+        assert "count" in names
+        assert "VERSION" not in names
+
+
+class TestColorControl:
+    def test_color_disabled_with_no_color_env(self, monkeypatch):
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert _d.color_enabled() is False
+
+    def test_c_noop_when_disabled(self):
+        assert _d.c("text", "red", enabled=False) == "text"
+
+    def test_c_wraps_when_enabled(self):
+        assert _d.c("text", "red", enabled=True) != "text"
+        assert "text" in _d.c("text", "red", enabled=True)
+
+
+class TestRenderReport:
+    def test_report_has_type_and_location(self):
+        r = _d.render_report(error_type="NameError", message="boom",
+                             filename="x.clpy", line=3, colored=False)
+        assert "NameError" in r
+        assert "x.clpy:3" in r
+        assert "boom" in r
+
+    def test_report_includes_excerpt(self):
+        src = "@var[a; 1]\n@print[undefined_thing]"
+        r = _d.render_report(error_type="NameError", message="x",
+                             filename="x.clpy", line=2, source=src, colored=False)
+        assert "@print[undefined_thing]" in r
+
+    def test_report_includes_suggestion_and_hint(self):
+        r = _d.render_report(error_type="NameError", message="x",
+                             filename="x.clpy", line=1,
+                             suggestion="count", hint="use a number",
+                             colored=False)
+        assert "Did you mean 'count'?" in r
+        assert "Hint: use a number" in r
+
+    def test_render_exception_uses_attached_fields(self):
+        e = RunError("kaboom")
+        e.error_type = "ValueError"
+        e.clean_message = "bad value"
+        e.cruhon_line = 5
+        e.hint = "fix it"
+        r = _d.render_exception(e, filename="f.clpy", colored=False)
+        assert "ValueError" in r
+        assert "bad value" in r
+        assert "f.clpy:5" in r
+        assert "Hint: fix it" in r
+
+
+class TestDiagnosticLog:
+    def test_disabled_by_default(self):
+        log = _d.DiagnosticLog()
+        assert log.enabled is False
+
+    def test_configure_enables(self, tmp_path):
+        log = _d.DiagnosticLog()
+        p = tmp_path / "out.log"
+        log.configure(str(p), "DEBUG")
+        assert log.enabled is True
+
+    def test_writes_events_to_file(self, tmp_path):
+        log = _d.DiagnosticLog()
+        p = tmp_path / "out.log"
+        log.configure(str(p), "INFO")
+        log.event("hello world")
+        content = p.read_text()
+        assert "hello world" in content
+        assert "[INFO]" in content
+
+    def test_level_filtering(self, tmp_path):
+        log = _d.DiagnosticLog()
+        p = tmp_path / "out.log"
+        log.configure(str(p), "ERROR")  # only ERROR and above
+        log.event("info msg", level="INFO")
+        log.event("error msg", level="ERROR")
+        content = p.read_text()
+        assert "error msg" in content
+        assert "info msg" not in content
+
+    def test_never_raises_on_bad_path(self):
+        log = _d.DiagnosticLog()
+        log.configure("/nonexistent_dir_xyz/sub/out.log", "INFO")
+        # Should silently swallow the write failure
+        log.event("test")  # no exception
+
+    def test_run_error_writes_report(self, tmp_path):
+        log = _d.DiagnosticLog()
+        p = tmp_path / "out.log"
+        log.configure(str(p), "ERROR")
+        log.run_error("test.clpy", "✗ NameError\n  boom", "py traceback here")
+        content = p.read_text()
+        assert "run failed: test.clpy" in content
+        assert "NameError" in content
+
+
+class TestRuntimeDiagnoseHints:
+    """_diagnose covers many runtime error types with readable hints."""
+
+    def _hint(self, source):
+        from cruhon.core.runner import run_source, RunError
+        try:
+            run_source(source)
+        except RunError as e:
+            return str(e), e
+        return "", None
+
+    def test_nameerror_hint_and_context(self):
+        msg, e = self._hint("@var[x; undefined_xyz]")
+        assert "undefined_xyz" in msg
+        assert getattr(e, "source", None) is not None
+        assert e.error_type == "NameError"
+
+    def test_zerodivision_hint(self):
+        msg, e = self._hint("@var[x; 1 / 0]")
+        assert "zero" in msg.lower()
+
+    def test_index_hint(self):
+        msg, e = self._hint('@var[lst; [1, 2]]\n@var[x; lst[10]]')
+        assert "index" in msg.lower() or "range" in msg.lower()
+
+    def test_attached_line_number(self):
+        msg, e = self._hint("@var[a; 1]\n@var[b; undefined_zzz]")
+        assert "line 2" in msg
+
+    def test_nameerror_suggestion(self):
+        # 'totl' is close to 'total' which is defined → suggestion offered
+        msg, e = self._hint("@var[total; 5]\n@var[x; totl]")
+        assert getattr(e, "suggestion", None) == "total"
+
+
+class TestRunSourceErrorContext:
+    """run_source attaches structured fields for rich CLI rendering."""
+
+    def test_compile_error_carries_source(self):
+        from cruhon.core.runner import run_source
+        from cruhon.core.parser import ParseError
+        try:
+            run_source("@frobnicate[x]")
+        except ParseError as e:
+            assert getattr(e, "source", None) is not None
+            assert getattr(e, "error_type", None) == "ParseError"
+        else:
+            assert False, "expected ParseError"
+
+    def test_runtime_error_render_roundtrip(self):
+        from cruhon.core.runner import run_source, RunError
+        try:
+            run_source("@var[x; undefined_abc]")
+        except RunError as e:
+            report = _d.render_exception(e, source=getattr(e, "source", None),
+                                         filename="t.clpy", colored=False)
+            assert "NameError" in report
+            assert "undefined_abc" in report

@@ -1,0 +1,82 @@
+{
+  "current": "2.7.0",
+  "spec_version": "1.0",
+  "frozen": false,
+  "semantic_freeze": {
+    "active_from": "0.5.0",
+    "rule": "No new syntax until regression suite is 100% stable",
+    "eval_model": "_eval_value(value, context) — single truth function",
+    "contexts": ["expr", "display"]
+  },
+  "history": [
+    {"version": "0.1.0",   "status": "released", "summary": "MVP — lexer, parser, transpiler, runner, mod system, CLI"},
+    {"version": "0.2.0",   "status": "released", "summary": "Bug fixes, @const, @env, @include, @assert, @list, @dict"},
+    {"version": "0.3.0",   "status": "released", "summary": "Deterministic plugin loader, middleware override chain, --show-python, version checks"},
+    {"version": "0.4.0",   "status": "released", "summary": "All missing commands, @http.*, @store.*, inline @commands, auto-imports, line numbers"},
+    {"version": "0.5.0",   "status": "released", "summary": "Semantic stabilization: unified _eval_value, ; enforcement, semantics.md, line map fix"},
+    {"version": "0.6.0",   "status": "released", "summary": "SyntaxEngine: unified argument parsing. Fixed list/dict literals in @var. spec/architecture.md"},
+    {"version": "0.7.0",   "status": "released", "summary": "Stdlib: @file @time @math @json @color. SyntaxWarning fix."},
+    {"version": "0.8.0",   "status": "released", "summary": "Namespace runtime system. NamespaceCallNode. ModAPI.namespace()/require(). DependencyResolver. __ns__ in exec(). Example discord mod."},
+    {"version": "0.9.0a1", "status": "released", "summary": "v0.9a: Namespace isolation. access_state/write_state/allow_peer. No AST/parser/transpiler changes."},
+    {"version": "0.9.0",   "status": "released", "summary": "v0.9b: Minimal async runtime. Runner detects async def main and appends asyncio.run(). @http.async_get/post/json added via httpx."},
+    {
+      "version": "0.9.1",
+      "status": "released",
+      "summary": "v0.9.1: Fix @raw (was never implemented — parser, ast_nodes, transpiler). Fix dict literal false positive in _eval_value (added _is_python_expression/_is_fstring_template helpers). No new features. No architecture changes."
+    },
+    {
+      "version": "0.9.2",
+      "status": "released",
+      "summary": "v0.9.2: Pre-release cleanup. Namespace conflict fix (first wins, second gets existing ns back). Path traversal guard in @file.* and @json.read/write. HTTP timeout=30 on all sync requests. SSRF guard in @http.*. Version consistency across all files. Docs updated to v0.9 Stable. library.md translated to English."
+    },
+    {"version": "1.0.0",   "status": "released", "summary": "v1.0.0: Named parameters (key=value args), friendly error hints, block plugin commands (api.block_command), context variables (__ctx__ / @ctx / @ctx.set), 139-test suite, PluginBlockNode, parse_plugin_block(). Stable plugin API."},
+    {"version": "1.1.0",   "status": "released", "summary": "v1.1.0: Plugin Foundation System — api.expose/consume/is_loaded/config, version-aware dependency checking, error attribution in plugin visitors, list_exposed_apis(). 150-test suite."},
+    {"version": "1.2.0",   "status": "released", "summary": "v1.2.0: Plugin gaps — scoped ctx (api.block_command scoped=True), node transforms (api.transform), block lifecycle hooks (api.block_hook), __ctx_stack__, __ph__. 156-test suite."},
+    {"version": "1.3.0",   "status": "released", "summary": "v1.3.0: Language completion — @with, @match/@case/@default, @del, @raise, multi-line expression fix. 172-test suite."},
+    {"version": "1.4.0",   "status": "released", "summary": "v1.4.0: Plugin system hardening — parse-time AST hooks (api.ast_hook), @async.for/@async.with, plugin error attribution, list_block_commands(), cruhon mods enrichment, cruhon new --plugin scaffold. 194-test suite."},
+    {"version": "1.5.0",   "status": "released", "summary": "v1.5.0: Plugin freedom — api.inject() (exec globals), api.inline_command() (inline expr plugins), api.eval_hook() (value evaluation). 210-test suite."},
+    {"version": "1.6.0",   "status": "released", "summary": "v1.6.0: Module system — @module/@export/@use/@from. Real encapsulation, file-based loading, circular dep detection, plugin compat. f-string template detection improved. 237-test suite."},
+    {
+      "version": "2.0.0",
+      "status": "released",
+      "summary": "v2.0.0: Full Python parity audit. CLI: cruhon repl, docs, fmt, run --watch. Language: for/while else, @comp types (dict/set/gen), @decorator, multi-catch, multi-with, @import alias. Bug fixes: f-string double-wrapping, STRING re-quoting, @print multi-arg + sep/end, @assert optional message, @raise from=. @input usable inline. Version sync."
+    },
+    {
+      "version": "2.1.0",
+      "status": "released",
+      "summary": "v2.1.0: Rich diagnostics (core/diagnostics.py) — source excerpt + caret + hint + did-you-mean, more readable than Python. Opt-in diagnostic logging to file via CRUHON_LOG / --log. 20 new stdlib namespaces (@random @collections @itertools @functools @sys @io @copy @base64 @url @statistics @contextlib @enum @dataclasses @typing @threading @queue @heapq @bisect @operator @pprint). Plugin freedom: api.inject_once, unregister_command/remove_hook/remove_inject/remove_eval_hook, override node-name map fixed for all 40+ nodes, on_error fires for Parse/RunError, after_run gets source/python_code, pip mod version + config support. 1247-test suite."
+    },
+    {
+      "version": "2.2.0",
+      "status": "released",
+      "summary": "v2.2.0: cruhon-shortcuts plugin — a fully configurable shortcut layer (mods/cruhon-shortcuts, 13 group files) giving shorter syntax for all namespaces: global aliases (@read→@file.read, @now→@date.now, @uuid→@crypto.uuid) plus 200+ new convenience methods (@file.head/tail/grep, @date.tomorrow/age, @random.password, @statistics.summary, @collections.histogram, etc.). 5 new core stdlib namespaces backing it: @string @struct @zlib @calendar @email. Config keys: groups / global_aliases / method_aliases / disabled / custom. 1271-test suite."
+    },
+    {
+      "version": "2.3.0",
+      "status": "released",
+      "summary": "v2.3.0: Full expansion of the 5 v2.2 stdlib namespaces + second shortcut plugin. @string.*: char utilities (ascii_to_int, filter, exclude, count_in, translate) + random string generators (random_lower/upper/digits_str). @struct.*: unpack_list, first, pad, byte_order, to_hex, from_hex_str, native. @zlib.*: base64 wrappers (compress_b64/str, decompress_b64/str), adler32_hex, saved_bytes, is_zlib. @calendar.*: is_weekday/weekend, first_weekday_of, day_of_year, week_of_year, year_text, quarter, next_month, prev_month. @email.*: cc/bcc/reply_to/content_type getters, to_bytes, html_body, attach_text/bytes, all_attachments, set_cc/bcc/reply_to, address_list. New cruhon-shortcuts-pro plugin (mods/cruhon-shortcuts-pro, 5 groups, 120+ operations): @math.* (clamp/lerp/sign/gcd/lcm/sin/cos/tan/degrees/…), @collections.* lists (window/transpose/unzip/rotate/partition/chunks/sorted_by/…), @collections.* dicts (pick_keys/omit_keys/deep_merge/dict_diff/flatten_nested/…), @collections.* logic (coalesce/first_where/count_if/group_by/tally/…), @text.* (camel_case/snake_case/kebab_case/word_freq/ordinal/de_accent/…). 1316-test suite."
+    },
+    {
+      "version": "2.4.0",
+      "status": "released",
+      "summary": "v2.4.0: 10 new data & format stdlib namespaces (no @import needed): @xml (xml.etree — parse/from_string/find/find_all/to_dict/find_text), @toml (tomllib — loads/load/get/keys/has), @diff (difflib — ratio/is_similar/unified/ndiff/close_matches/best_match), @decimal (exact base-10 math — make/add/mul/round/sum/sqrt/quantize), @fraction (exact rationals — make/from_float/add/numerator/limit), @ip (ipaddress — address/network/is_private/version/hosts/num_addresses/contains), @platform (system/release/machine/python_version/is_windows/is_linux/is_mac), @unicode (unicodedata — name/lookup/category/numeric/normalize/nfc/strip_accents), @binascii (hexlify/unhexlify/b2a_base64/crc32), @shlex (split/join/quote/quote_all). Third shortcut plugin cruhon-shortcuts-data (mods/cruhon-shortcuts-data, 3 groups: format/numbers/system) with aliases like @xml_parse, @toml_load, @similar, @dec_of, @frac, @money, @is_private_ip, @os_name, @char_name, @hexlify, @sh_split plus new convenience methods (@xml.text_all, @diff.changed, @decimal.money/percent/average, @fraction.reciprocal, @ip.is_ipv4/is_ipv6/first_host, @platform.summary, @binascii.hex_spaced). Loads cleanly alongside cruhon-shortcuts and cruhon-shortcuts-pro. 1401-test suite."
+    },
+    {
+      "version": "2.5.0",
+      "status": "released",
+      "summary": "v2.5.0: Language — @retry[n; ExcType], @timeout[s], @macro/@call (named reusable blocks). CLI — cruhon lint, cruhon test, cruhon bundle. Stdlib — @re.* (14 methods, inline __import__), @yaml.* (PyYAML, 10 methods), @image.* (Pillow, 18 methods), @pdf.* (pdfplumber, 10 methods). cruhon-shortcuts-pro: 3 new groups — regex (re_match/find/sub/…), http (retry_get/bearer/json_post/…), file (read_file/write_file/find/joinpath/…). Match/case guard expressions confirmed working. 1442-test suite."
+    },
+    {
+      "version": "2.6.0",
+      "status": "released",
+      "summary": "v2.6.0: Language — @template[name]...@end + @render[name; k=v] (string template system with format_map), @spread[fn; iter] + @unpack[fn; dict] (positional/keyword spread, statement + inline), @let[x; v1; y; v2; ...] (multi-variable assignment), @pipeline[name; fn1; fn2; ...] + @apply[name; value] (function composition pipelines). LSP — VS Code + Neovim extensions via pygls 2.x (completions, diagnostics, hover, symbols, go-to-definition). Bug fix: _apply_ast_hooks no longer corrupts string body fields. cruhon-shortcuts-data v1.1.0 adds @re/@yaml/@image/@pdf shortcuts. 1505-test suite."
+    },
+    {
+      "version": "2.7.0",
+      "status": "released",
+      "summary": "v2.7.0: Type system — @var[x: int; 42] and @const[MAX: int; 100] emit Python type annotations. @func[name; a: int; b: int; return=int] emits typed signatures with -> return type. @type[Name; Alias] declares type aliases. @dataclass[Name]...@end block emits @dataclass class with annotated fields. REPL — readline history (~/.cruhon_history, persistent across sessions), tab-autocomplete for all @commands and :meta-commands, new :history [n], :load <file>, :type <expr> commands. LSP — @dataclass added to block openers; @type and @dataclass completions. 1536-test suite."
+    }
+  ],
+  "frozen_at": null,
+  "breaking_change_policy": "major version bump required"
+}

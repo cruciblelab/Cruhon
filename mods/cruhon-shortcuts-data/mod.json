@@ -1,0 +1,13 @@
+{
+    "name": "cruhon-shortcuts-data",
+    "version": "1.1.0",
+    "description": "Data & format shortcut plugin for Cruhon — shortcuts for @xml, @toml, @diff, @decimal, @fraction, @ip, @platform, @unicode, @binascii, @shlex (v2.4) and @re, @yaml, @image, @pdf (v2.5).",
+    "author": "CrucibleLab",
+    "cruhon": ">=2.5.0",
+
+    "groups": "all",
+
+    "disabled": [],
+
+    "custom": {}
+}
